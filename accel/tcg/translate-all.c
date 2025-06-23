@@ -95,6 +95,10 @@ void HELPER(afl_maybe_log)(target_ulong cur_loc) {
   afl_prev_loc = cur_loc >> 1;
 }
 
+void HELPER(afl_maybe_log2)(target_ulong cur_loc) {
+  INC_AFL_AREA(cur_loc);
+}
+
 void HELPER(afl_maybe_log_trace)(target_ulong cur_loc) {
   register uintptr_t afl_idx = cur_loc;
   INC_AFL_AREA(afl_idx);
@@ -122,23 +126,37 @@ static void afl_gen_trace(target_ulong cur_loc) {
      concern. Phew. But instruction addresses may be aligned. Let's mangle
      the value to get something quasi-uniform. */
 
-  // cur_loc = (cur_loc >> 4) ^ (cur_loc << 8);
-  // cur_loc &= MAP_SIZE - 1;
-  cur_loc = (uintptr_t)(afl_hash_ip((uint64_t)cur_loc));
-  cur_loc &= (MAP_SIZE - 1);
+  if (block_cov) {
 
-  /* Implement probabilistic instrumentation by looking at scrambled block
-     address. This keeps the instrumented locations stable across runs. */
+    cur_loc = block_id;
+    ++block_id;
+    if (block_id >= MAP_SIZE) block_id = 5;
 
-  if (cur_loc >= afl_inst_rms) return;
+    TCGv cur_loc_v = tcg_const_tl(cur_loc);
+    gen_helper_afl_maybe_log2(cur_loc_v);
+    tcg_temp_free(cur_loc_v);
 
-  TCGv cur_loc_v = tcg_const_tl(cur_loc);
-  if (unlikely(afl_track_unstable_log_fd() >= 0)) {
-    gen_helper_afl_maybe_log_trace(cur_loc_v);
   } else {
-    gen_helper_afl_maybe_log(cur_loc_v);
+
+    // cur_loc = (cur_loc >> 4) ^ (cur_loc << 8);
+    // cur_loc &= MAP_SIZE - 1;
+    cur_loc = (uintptr_t)(afl_hash_ip((uint64_t)cur_loc));
+    cur_loc &= (MAP_SIZE - 1);
+
+    /* Implement probabilistic instrumentation by looking at scrambled block
+       address. This keeps the instrumented locations stable across runs. */
+
+    if (cur_loc >= afl_inst_rms) return;
+
+    TCGv cur_loc_v = tcg_const_tl(cur_loc);
+    if (unlikely(afl_track_unstable_log_fd() >= 0)) {
+      gen_helper_afl_maybe_log_trace(cur_loc_v);
+    } else {
+      gen_helper_afl_maybe_log(cur_loc_v);
+    }
+    tcg_temp_free(cur_loc_v);
+
   }
-  tcg_temp_free(cur_loc_v);
 
 }
 
@@ -1955,7 +1973,10 @@ TranslationBlock *afl_gen_edge(CPUState *cpu, unsigned long afl_id)
     target_ulong afl_loc = afl_id & (MAP_SIZE -1);
     //*afl_dynamic_size = MAX(*afl_dynamic_size, afl_loc);
     TCGv tmp0 = tcg_const_tl(afl_loc);
-    gen_helper_afl_maybe_log(tmp0);
+    if (block_cov) 
+      gen_helper_afl_maybe_log2(tmp0);
+    else
+      gen_helper_afl_maybe_log(tmp0);
     tcg_temp_free(tmp0);
     tcg_gen_goto_tb(0);
     tcg_gen_exit_tb(tb, 0);
