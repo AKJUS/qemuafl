@@ -281,6 +281,15 @@ static void restore_memory_snapshot(void) {
 
 }
 
+static int use_ijon = 0;
+static unsigned char *ijon_map_ptr = dummy;
+static unsigned char *ijon_max_ptr = dummy;
+
+static void qemu_ijon_init() {
+  use_ijon = !!getenv("AFL_QEMU_IJON");
+  if (use_ijon == 0) return;
+}
+
 /* Set up SHM region and initialize other stuff. */
 
 static void afl_map_shm_fuzz(void) {
@@ -632,6 +641,8 @@ void afl_setup(void) {
               (persistent_exits ? "exits ": ""));
   }
 
+  qemu_ijon_init();
+
 }
 
 /* Fork server logic, invoked once we hit _start. */
@@ -643,55 +654,80 @@ void afl_forkserver(CPUState *cpu) {
 
   if (getenv("AFL_QEMU_DEBUG_MAPS")) open_self_maps(cpu->env_ptr, 1);
 
-  //u32   map_size = 0;
-  unsigned char tmp[4] = {0};
   pid_t child_pid;
   int   t_fd[2];
   u8    child_stopped = 0;
   u32   was_killed;
-  int   status = 0;
+  u32 version = 0x41464c00 + FS_NEW_VERSION_MAX;
+  u32 tmp = version ^ 0xffffffff, status2, status = version;
+  u8 *msg = (u8 *)&status;
+  u8 *reply = (u8 *)&status2;
 
-  if (!getenv("AFL_OLD_FORKSERVER")) {
-
-    // with the max ID value
-    if (MAP_SIZE <= FS_OPT_MAX_MAPSIZE)
-      status |= (FS_OPT_SET_MAPSIZE(MAP_SIZE) | FS_OPT_MAPSIZE);
-    if (lkm_snapshot) status |= FS_OPT_SNAPSHOT;
-    if (sharedmem_fuzzing != 0) status |= FS_OPT_SHDMEM_FUZZ;
-    if (status) status |= (FS_OPT_ENABLED | FS_OPT_NEWCMPLOG);
-
-  }
-
-  memcpy(tmp, &status, 4);
   if (getenv("AFL_DEBUG"))
     fprintf(stderr, "Debug: Sending status 0x%08x\n", status);
 
   /* Tell the parent that we're alive. If the parent doesn't want
      to talk, assume that we're not running in forkserver mode. */
 
-  if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+  if (write(FORKSRV_FD + 1, msg, 4) != 4) return;
 
   afl_forksrv_pid = getpid();
 
   int first_run = 1;
 
-  if (sharedmem_fuzzing) {
 
-    if (read(FORKSRV_FD, &was_killed, 4) != 4) exit(2);
+  if (!getenv("AFL_OLD_FORKSERVER")) {
 
-    if ((was_killed & (0xffffffff & (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ))) ==
-        (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ))
-      afl_map_shm_fuzz();
-    else {
+    if (read(FORKSRV_FD, reply, 4) != 4) { _exit(1); }
+    if (tmp != status2) {
 
-      fprintf(stderr,
-              "[AFL] ERROR: afl-fuzz is old and does not support"
-              " shmem input");
-      exit(1);
+      fprintf(stderr, "wrong forkserver message from AFL++ tool");
+      _exit(1);
 
     }
 
+    // send the set/requested options to forkserver
+    status = FS_NEW_OPT_MAPSIZE;  // we always send the map size
+    if (lkm_snapshot) status |= FS_OPT_SNAPSHOT;
+    if (sharedmem_fuzzing) status |= FS_NEW_OPT_SHDMEM_FUZZ;
+
+
+    u32 __afl_map_size = MAP_SIZE;
+
+    if (use_ijon) {
+
+      __afl_map_size = (((__afl_map_size + 63) >> 6) << 6);
+      __afl_map_size += MAP_SIZE_IJON_MAP + MAP_SIZE_IJON_BYTES;
+
+      ijon_map_ptr = afl_area_ptr + MAP_SIZE;
+      ijon_max_ptr = ijon_map_ptr + MAP_SIZE;
+
+      status |= FS_OPT_IJON;
+
+    }
+
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) {
+
+      errno = 0;
+      _exit(1);
+
+    }
+
+    // Now send the parameters for the set options, increasing by option number
+
+    // FS_NEW_OPT_MAPSIZE - we always send the map size
+    status = __afl_map_size;
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) { _exit(1); }
+
+    // send welcome message as final message
+    status = version;
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) { _exit(1); }
+
   }
+
+  // END forkserver handshake
+
+  if (sharedmem_fuzzing) { afl_map_shm_fuzz(); }
 
   /* All right, let's await orders... */
 
