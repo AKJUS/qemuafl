@@ -1,9 +1,6 @@
 [submodule "roms/seabios"]
 	path = roms/seabios
 	url = https://gitlab.com/qemu-project/seabios.git/
-[submodule "roms/SLOF"]
-	path = roms/SLOF
-	url = https://gitlab.com/qemu-project/SLOF.git
 [submodule "roms/ipxe"]
 	path = roms/ipxe
 	url = https://gitlab.com/qemu-project/ipxe.git
