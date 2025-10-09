@@ -36,6 +36,13 @@
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/selfmap.h"
+#include "qapi/qmp/qjson.h"  /* qobject_from_json() */
+#include "qapi/qmp/qdict.h"  /* QDict, qdict_first, qdict_next, qdict_get_try_str 等 */
+#include "qapi/qmp/qstring.h"/* qobject_to_qstring, qstring_get_str */
+#include "qapi/qmp/qlist.h"
+#include "qapi/qmp/qnum.h"
+#include "qapi/error.h"
+
 #if defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
 #include "hw/i386/apic.h"
 #endif
@@ -47,7 +54,7 @@
 
 #include "qemuafl/common.h"
 #include "qemuafl/imported/snapshot-inl.h"
-#include "qemuafl/imported/afl-ijon-min.h"
+#include "qemuafl/qemu-ijon-support.h"
 
 #include <string.h>
 #include <sys/shm.h>
@@ -295,13 +302,209 @@ __thread u32 __afl_ijon_state = 0;
 __thread u32 __afl_ijon_state_log = 0;
 #endif
 
-static void qemu_ijon_init() {
-  use_ijon = !!getenv("AFL_QEMU_IJON");
-  if (use_ijon == 0) return;
+uint32_t ijon_hooker_cnt = 0;
+target_ulong hook_code_addr[0x1000];
+target_ulong g_var_addr[0x1000];
+uint32_t g_var_len[0x1000];
+uint32_t ijon_type[0x1000];
+
+/* 读取整个文件到 malloc 的缓冲区（调用者负责 free） */
+static ssize_t read_file_all(const char *path, char **out_buf) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    rewind(f);
+    char *buf = g_malloc(sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t r = fread(buf, 1, sz, f);
+    fclose(f);
+    buf[r] = '\0';
+    *out_buf = buf;
+    return (ssize_t)r;
 }
 
+/* 解析入口（使用 QDict / qjson / qlist / qstring） */
+static void qemu_ijon_init(void) {
+    const char *path = getenv("AFL_QEMU_IJON");
+    use_ijon = !!path;
+    if (!use_ijon) return;
 
-// copy from afl-compiler-rt.o.c
+    char *json = NULL;
+    ssize_t len = read_file_all(path, &json);
+    if (len < 0) {
+        fprintf(stderr, "ijon: cannot read '%s'\n", path ? path : "(null)");
+        exit(-1);
+    }
+
+    Error *err = NULL;
+    QObject *root_obj = qobject_from_json(json, &err);
+    if (!root_obj) {
+      error_reportf_err(err, "ijon: qobject_from_json failed: \n");
+      exit(-1);
+    }
+
+    /* 期望顶层是数组（QList） */
+    QList *top_list = qobject_to(QList, root_obj);
+    if (!top_list) {
+      fprintf(stderr, "ijon: top-level JSON is not an array\n");
+      exit(-1);
+    }
+
+    /* 遍历外层数组（元素应为数组/列表，每个内层包含 4 个元素） */
+    const QListEntry *le;
+    for (le = qlist_first(top_list); le != NULL; le = qlist_next(le)) {
+
+        QObject *elem = le->value;
+        if (!elem) continue;
+
+        /* elem 本身应为内层数组（QList） */
+        QList *inner = qobject_to(QList, elem);
+        if (!inner) {
+            fprintf(stderr, "ijon: element is not an array, skipping\n");
+            continue;
+        }
+
+        /* 遍历内层数组并按顺序读取四个元素 */
+        const QListEntry *ile = qlist_first(inner);
+        if (!ile) { fprintf(stderr, "ijon: empty inner array, skip\n"); continue; }
+
+        /* 1) hook addr string */
+        QObject *o_hook = ile->value;
+        ile = qlist_next(ile);
+        if (!o_hook || !ile) { fprintf(stderr, "ijon: inner array too short (hook)\n"); continue; }
+
+        target_ulong hook_addr;
+        QString *qhook = qobject_to(QString, o_hook);
+        if (qhook) {
+
+          const char *hook_s = qstring_get_str(qhook);
+
+          errno = 0;
+          char *endptr = NULL;
+          hook_addr = strtoul(hook_s, &endptr, 0);
+          if (errno || endptr == hook_s) { fprintf(stderr, "ijon: invalid hook addr '%s'\n", hook_s); continue;}
+
+        } else {
+
+          QNum *qhook = qobject_to(QNum, o_hook);
+          if (!qnum_get_try_uint(qhook, &hook_addr)) { fprintf(stderr, "ijon: cant get hook addr, skip\n"); continue;}
+
+        }
+
+        /* 2) method/type string */
+        QObject *o_type = ile->value;
+        ile = qlist_next(ile);
+        if (!o_type || !ile) { fprintf(stderr, "ijon: inner array too short (type)\n"); continue; }
+
+        QString *qtype = qobject_to(QString, o_type);
+        if (!qtype) { fprintf(stderr, "ijon: type element not a string, skip\n"); continue; }
+
+        const char *type_s = qstring_get_str(qtype);
+        int itype = str_to_ijon(type_s);
+        if (itype == -1) { fprintf(stderr, "ijon: unknown method '%s' (hook 0x%lx)\n", type_s, (unsigned long)hook_addr); continue;}
+
+        /* 3) var addr string */
+        QObject *o_var = ile->value;
+        ile = qlist_next(ile);
+        if (!o_var || !ile) { fprintf(stderr, "ijon: inner array too short (var)\n"); continue; }
+
+        target_ulong var_addr;
+        QString *qvar = qobject_to(QString, o_var);
+        if (qvar) {
+
+          const char *var_s = qstring_get_str(qvar);
+
+          errno = 0;
+          var_addr = strtoul(var_s, NULL, 0);
+          if (errno) { fprintf(stderr, "ijon: invalid var addr '%s' (hook 0x%lx)\n", var_s, (unsigned long)hook_addr); continue;}
+
+        } else {
+
+          QNum *qvar = qobject_to(QNum, o_var);
+          if (!qnum_get_try_uint(qvar, &var_addr)) { fprintf(stderr, "ijon: cant get var addr, skip\n"); continue;}
+
+        }
+
+
+        /* 4) length (可以是字符串或数字，但这里我们期望字符串或 primitive，可以尝试 qobject_to_qstring 或 qobject_to_qint) */
+        QObject *o_len = ile->value;
+        /* ile = qlist_next(ile); // 不需要进一步移动 */
+        if (!o_len) { fprintf(stderr, "ijon: inner array missing length, skip\n"); continue; }
+
+        int64_t var_len = 0;
+        /* 尝试当作 QString 处理 */
+        QString *qlen = qobject_to(QString, o_len);
+        if (qlen) {
+
+            const char *len_s = qstring_get_str(qlen);
+
+            errno = 0;
+            var_len = strtoul(len_s, NULL, 0);
+            if (errno) { fprintf(stderr, "ijon: invalid length '%s' (hook 0x%lx)\n", len_s, (unsigned long)hook_addr); continue; }
+
+        } else {
+
+            QNum *qlen = qobject_to(QNum, o_len);
+            if (!qnum_get_try_int(qlen, &var_len)) { fprintf(stderr, "ijon: invalid var length  (hook 0x%lx)\n", (unsigned long)hook_addr); continue;}
+
+        }
+
+        /* 插入 mapping（直接写入数组并增加计数），保持边界检查 */
+        if (ijon_hooker_cnt >= 0x1000) {
+            fprintf(stderr, "ijon: entry limit reached, skip\n");
+            break;
+        }
+
+        hook_code_addr[ijon_hooker_cnt] = hook_addr;
+        g_var_addr[ijon_hooker_cnt] = var_addr;
+        ijon_type[ijon_hooker_cnt] = (uint32_t)itype;
+        g_var_len[ijon_hooker_cnt] = var_len;
+        ijon_hooker_cnt++;
+    }
+
+    /* 清理并打印结果 */
+    qobject_unref(root_obj);
+    g_free(json);
+
+    fprintf(stderr, "ijon: loaded %u mappings\n", ijon_hooker_cnt);
+    for (uint32_t i = 0; i < ijon_hooker_cnt; i++) {
+        fprintf(stderr, "ijon[%u]: hook=0x%lx type=%s var=0x%lx len=%u\n",
+                i, (unsigned long)hook_code_addr[i],
+                ijon_to_str(ijon_type[i]),
+                (unsigned long)g_var_addr[i],
+                (unsigned)g_var_len[i]);
+    }
+
+}
+
+const char* ijon_to_str(IJON v) {
+  switch(v) {
+#define X(name, func) case e_##name: return #name;
+    IJON_LIST
+#undef X
+    default: return "UNKNOWN";
+  }
+}
+
+IJON str_to_ijon(const char* str) {
+#define X(name, func) if (strcmp(str, #name) == 0) return e_##name;
+  IJON_LIST
+#undef X
+  return -1;
+}
+
+void ijon_dispatch(IJON v, uint32_t addr, u64 val) {
+  switch(v) {
+#define X(name, func) case e_##name: func(addr, val); break;
+    IJON_LIST
+#undef X
+    default: printf("Unknown IJON value\n"); break;
+  }
+}
+
+// Reference from afl-compiler-rt.o.c
 
 /* IJON max tracking runtime functions */
 
@@ -365,8 +568,8 @@ uint32_t ijon_hashmem(uint32_t old, char *val, size_t len) {
 
 void ijon_max(uint32_t addr, u64 val) {
 
-  u32 var_id = (u32)(ijon_simple_hash((uint64_t)addr) % MAP_SIZE_IJON_ENTRIES);
-  // u32 var_id = (u32)(addr % MAP_SIZE_IJON_ENTRIES);
+  // u32 var_id = (u32)(ijon_simple_hash((uint64_t)addr) % MAP_SIZE_IJON_ENTRIES);
+  u32 var_id = (u32)(addr % MAP_SIZE_IJON_ENTRIES);
 
   if (ijon_max_ptr[var_id] < val) { ijon_max_ptr[var_id] = val; }
 
@@ -384,7 +587,7 @@ void ijon_set(uint32_t loc_addr, uint32_t val) {
   // ORIGINAL IJON APPROACH: XOR location hash with value to create unique
   // coverage point This follows the original:
   // ijon_map_set(ijon_hashstr(__LINE__,__FILE__)^(x))
-  u32 combined_hash = loc_addr ^ val;
+  u32 combined_hash = ijon_simple_hash(loc_addr) ^ val;
   u32 coverage_id = combined_hash % MAP_SIZE_IJON_MAP;
 
   ijon_map_ptr[coverage_id] = 1;
@@ -396,8 +599,7 @@ void ijon_inc(uint32_t loc_addr, uint32_t val) {
   // ORIGINAL IJON APPROACH: XOR location hash with value to create unique
   // coverage point This follows the original:
   // ijon_map_set(ijon_hashstr(__LINE__,__FILE__)^(x))
-  uint32_t combined_hash = loc_addr ^ val;
-
+  uint32_t combined_hash = ijon_simple_hash(loc_addr) ^ val;
   u32 coverage_id = combined_hash % MAP_SIZE_IJON_MAP;
 
   // Memory-safe: Use actual available shared memory size
@@ -465,13 +667,13 @@ void ijon_min_variadic(uint32_t addr, ...) {
 
 /* IJON state management functions */
 
-void ijon_xor_state(uint32_t val) {
+void ijon_xor_state(uint32_t addr, u64 val) {
 
-  __afl_ijon_state = (__afl_ijon_state ^ val) % (u32)MAP_SIZE_IJON_MAP;
+  __afl_ijon_state = (__afl_ijon_state ^ addr) % (u32)MAP_SIZE_IJON_MAP;
 
 }
 
-void ijon_reset_state(void) {
+void ijon_reset_state(uint32_t addr, u64 val) {
 
   __afl_ijon_state = 0;
   __afl_ijon_state_log = 0;
@@ -566,8 +768,6 @@ uint32_t ijon_memdist(char *a, char *b, size_t len) {
   }
 
 }
-
-//end copy
 
 /* Set up SHM region and initialize other stuff. */
 

@@ -33,8 +33,17 @@
 #include "tcg/tcg.h"
 
 #include "qemuafl/common.h"
+#include "qemuafl/qemu-ijon-support.h"
 
 uint32_t afl_hash_ip(uint64_t);
+
+void HELPER(ijon_func_call)(target_ulong var_addr, target_ulong var_len, target_ulong itype, target_ulong idx)
+{
+  uint64_t buf = 0;
+  memcpy(&buf, var_addr, var_len);
+  ijon_dispatch(itype, idx, buf);
+  fprintf(stderr, "trigger ijon: addr=0x%016" PRIx64 " tag=%s value %ld\n", var_addr, ijon_to_str(itype), buf);
+}
 
 void HELPER(afl_entry_routine)(CPUArchState *env) {
 
