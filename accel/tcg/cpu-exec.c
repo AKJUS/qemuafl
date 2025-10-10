@@ -325,148 +325,137 @@ static ssize_t read_file_all(const char *path, char **out_buf) {
     return (ssize_t)r;
 }
 
-/* 解析入口（使用 QDict / qjson / qlist / qstring） */
+static char *trim(char *s) {
+  if (!s) return s;
+  // left
+  while (*s && isspace((unsigned char)*s)) s++;
+  if (*s == 0) return s;
+  // right
+  char *end = s + strlen(s) - 1;
+  while (end > s && isspace((unsigned char)*end)) { *end = '\0'; end--; }
+  return s;
+}
+
+// parse unsigned integer (hex if 0x prefix, or decimal)
+// returns 0 on success, non-zero on failure
+static int parse_uint64_str(const char *s, target_ulong *out) {
+  if (!s || !*s) return -1;
+  errno = 0;
+  char *endp = NULL;
+  unsigned long long val = strtoull(s, &endp, 0); // base 0 自动识别 0x
+  if (endp == s) return -1; // no conversion
+  if (errno == ERANGE) return -1;
+  *out = (target_ulong)val;
+  return 0;
+}
+
+/* Parse the ijon configuration file, which stores the following data structure:
+ * 0x4001200,ijon_set,0x4000005064,8
+ * 0x40012bb,ijon_min,RAX,4
+ * code addr, ijon method, var addr/reg, var len
+ */
 static void qemu_ijon_init(void) {
     const char *path = getenv("AFL_QEMU_IJON");
     use_ijon = !!path;
     if (!use_ijon) return;
 
-    char *json = NULL;
-    ssize_t len = read_file_all(path, &json);
-    if (len < 0) {
+    char *buf = NULL;
+    ssize_t buf_len = read_file_all(path, &buf);
+    if (buf_len < 0) {
         fprintf(stderr, "ijon: cannot read '%s'\n", path ? path : "(null)");
         exit(-1);
     }
 
-    Error *err = NULL;
-    QObject *root_obj = qobject_from_json(json, &err);
-    if (!root_obj) {
-      error_reportf_err(err, "ijon: qobject_from_json failed: \n");
-      exit(-1);
-    }
+    char *buf_copy = malloc(buf_len + 1);
+    if (!buf_copy) exit(-1);
+    memcpy(buf_copy, buf, buf_len);
+    buf_copy[buf_len] = '\0';
 
-    /* 期望顶层是数组（QList） */
-    QList *top_list = qobject_to(QList, root_obj);
-    if (!top_list) {
-      fprintf(stderr, "ijon: top-level JSON is not an array\n");
-      exit(-1);
-    }
+    char *line_ctx;
+    char *line = strtok_r(buf_copy, "\n", &line_ctx);
+    while (line && ijon_hooker_cnt < 0x1000) {
+        char *s = trim(line);
+        if (*s == '\0') { line = strtok_r(NULL, "\n", &line_ctx); continue; } // 空行
+        if (*s == '#') { line = strtok_r(NULL, "\n", &line_ctx); continue; }   // 注释行
 
-    /* 遍历外层数组（元素应为数组/列表，每个内层包含 4 个元素） */
-    const QListEntry *le;
-    for (le = qlist_first(top_list); le != NULL; le = qlist_next(le)) {
+        // 分割 4 个字段（允许字段中间有空白）
+        // 采用手动查找逗号，避免 strtok 在字段内容含逗号时出问题（这里不考虑字段含逗号）
+        char *f1 = s;
+        char *p = strchr(s, ',');
+        if (!p) { line = strtok_r(NULL, "\n", &line_ctx); continue; } // 格式错误，跳过
+        *p = '\0'; char *f2 = trim(p + 1);
 
-        QObject *elem = le->value;
-        if (!elem) continue;
+        // next comma
+        p = strchr(f2, ',');
+        if (!p) { line = strtok_r(NULL, "\n", &line_ctx); continue; }
+        *p = '\0'; char *f3 = trim(p + 1);
 
-        /* elem 本身应为内层数组（QList） */
-        QList *inner = qobject_to(QList, elem);
-        if (!inner) {
-            fprintf(stderr, "ijon: element is not an array, skipping\n");
-            continue;
+        // last comma
+        p = strchr(f3, ',');
+        if (!p) { line = strtok_r(NULL, "\n", &line_ctx); continue; }
+        *p = '\0'; char *f4 = trim(p + 1);
+
+        f1 = trim(f1);
+        f2 = trim(f2);
+        f3 = trim(f3);
+        f4 = trim(f4);
+
+        // 解析每个字段，任一失败则跳过该行
+        int ok = 1;
+
+        // field1 -> hook_code_addr[ijon_hooker_cnt]
+        target_ulong addr0;
+        if (parse_uint64_str(f1, &addr0) != 0) { ok = 0; }
+
+        // field2 -> ijon_type[ijon_hooker_cnt] via str_to_ijon
+        uint32_t type2 = str_to_ijon(f2);
+        if (type2 == -1) { ok = 0; }
+
+        // field3 -> g_var_addr[ijon_hooker_cnt] : numeric -> addr, string -> convert via str_to_ijon_reg (enum -> store as target_ulong)
+        target_ulong gaddr = 0;
+        if (ok) {
+            // 判断是否以数字开头或以 0x 开头或全数字（允许带负号? 这里假设不带）
+            int looks_like_number = 0;
+            const char *t = f3;
+            if (*t == '0' && (t[1]=='x' || t[1]=='X')) looks_like_number = 1;
+            else if (isdigit((unsigned char)*t)) looks_like_number = 1;
+
+            if (looks_like_number) {
+                if (parse_uint64_str(f3, &gaddr) != 0) ok = 0;
+            } else {
+                uint32_t reg_enum = ijon_reg_to_addr(f3);
+                if (reg_enum == -1) ok = 0;
+                else {
+                  CPUArchState* env = first_cpu->env_ptr;
+                  gaddr = &env->regs[reg_enum];
+                }
+            }
         }
 
-        /* 遍历内层数组并按顺序读取四个元素 */
-        const QListEntry *ile = qlist_first(inner);
-        if (!ile) { fprintf(stderr, "ijon: empty inner array, skip\n"); continue; }
-
-        /* 1) hook addr string */
-        QObject *o_hook = ile->value;
-        ile = qlist_next(ile);
-        if (!o_hook || !ile) { fprintf(stderr, "ijon: inner array too short (hook)\n"); continue; }
-
-        target_ulong hook_addr;
-        QString *qhook = qobject_to(QString, o_hook);
-        if (qhook) {
-
-          const char *hook_s = qstring_get_str(qhook);
-
-          errno = 0;
-          char *endptr = NULL;
-          hook_addr = strtoul(hook_s, &endptr, 0);
-          if (errno || endptr == hook_s) { fprintf(stderr, "ijon: invalid hook addr '%s'\n", hook_s); continue;}
-
-        } else {
-
-          QNum *qhook = qobject_to(QNum, o_hook);
-          if (!qnum_get_try_uint(qhook, &hook_addr)) { fprintf(stderr, "ijon: cant get hook addr, skip\n"); continue;}
-
-        }
-
-        /* 2) method/type string */
-        QObject *o_type = ile->value;
-        ile = qlist_next(ile);
-        if (!o_type || !ile) { fprintf(stderr, "ijon: inner array too short (type)\n"); continue; }
-
-        QString *qtype = qobject_to(QString, o_type);
-        if (!qtype) { fprintf(stderr, "ijon: type element not a string, skip\n"); continue; }
-
-        const char *type_s = qstring_get_str(qtype);
-        int itype = str_to_ijon(type_s);
-        if (itype == -1) { fprintf(stderr, "ijon: unknown method '%s' (hook 0x%lx)\n", type_s, (unsigned long)hook_addr); continue;}
-
-        /* 3) var addr string */
-        QObject *o_var = ile->value;
-        ile = qlist_next(ile);
-        if (!o_var || !ile) { fprintf(stderr, "ijon: inner array too short (var)\n"); continue; }
-
-        target_ulong var_addr;
-        QString *qvar = qobject_to(QString, o_var);
-        if (qvar) {
-
-          const char *var_s = qstring_get_str(qvar);
-
-          errno = 0;
-          var_addr = strtoul(var_s, NULL, 0);
-          if (errno) { fprintf(stderr, "ijon: invalid var addr '%s' (hook 0x%lx)\n", var_s, (unsigned long)hook_addr); continue;}
-
-        } else {
-
-          QNum *qvar = qobject_to(QNum, o_var);
-          if (!qnum_get_try_uint(qvar, &var_addr)) { fprintf(stderr, "ijon: cant get var addr, skip\n"); continue;}
-
-        }
-
-
-        /* 4) length (可以是字符串或数字，但这里我们期望字符串或 primitive，可以尝试 qobject_to_qstring 或 qobject_to_qint) */
-        QObject *o_len = ile->value;
-        /* ile = qlist_next(ile); // 不需要进一步移动 */
-        if (!o_len) { fprintf(stderr, "ijon: inner array missing length, skip\n"); continue; }
-
-        int64_t var_len = 0;
-        /* 尝试当作 QString 处理 */
-        QString *qlen = qobject_to(QString, o_len);
-        if (qlen) {
-
-            const char *len_s = qstring_get_str(qlen);
-
+        // field4 -> g_var_len[ijon_hooker_cnt]
+        uint32_t len4 = 0;
+        if (ok) {
             errno = 0;
-            var_len = strtoul(len_s, NULL, 0);
-            if (errno) { fprintf(stderr, "ijon: invalid length '%s' (hook 0x%lx)\n", len_s, (unsigned long)hook_addr); continue; }
+            char *endp = NULL;
+            unsigned long v = strtoul(f4, &endp, 0);
+            if (endp == f4 || errno == ERANGE) ok = 0;
+            else len4 = (uint32_t)v;
+        }
 
+        if (ok) {
+            hook_code_addr[ijon_hooker_cnt] = addr0;
+            ijon_type[ijon_hooker_cnt] = type2;
+            g_var_addr[ijon_hooker_cnt] = gaddr;
+            g_var_len[ijon_hooker_cnt] = len4;
+            ijon_hooker_cnt++;
         } else {
-
-            QNum *qlen = qobject_to(QNum, o_len);
-            if (!qnum_get_try_int(qlen, &var_len)) { fprintf(stderr, "ijon: invalid var length  (hook 0x%lx)\n", (unsigned long)hook_addr); continue;}
-
+            // skip
         }
 
-        /* 插入 mapping（直接写入数组并增加计数），保持边界检查 */
-        if (ijon_hooker_cnt >= 0x1000) {
-            fprintf(stderr, "ijon: entry limit reached, skip\n");
-            break;
-        }
-
-        hook_code_addr[ijon_hooker_cnt] = hook_addr;
-        g_var_addr[ijon_hooker_cnt] = var_addr;
-        ijon_type[ijon_hooker_cnt] = (uint32_t)itype;
-        g_var_len[ijon_hooker_cnt] = var_len;
-        ijon_hooker_cnt++;
+        line = strtok_r(NULL, "\n", &line_ctx);
     }
 
-    /* 清理并打印结果 */
-    qobject_unref(root_obj);
-    g_free(json);
+    free(buf_copy);
 
     fprintf(stderr, "ijon: loaded %u mappings\n", ijon_hooker_cnt);
     for (uint32_t i = 0; i < ijon_hooker_cnt; i++) {
@@ -477,6 +466,58 @@ static void qemu_ijon_init(void) {
                 (unsigned)g_var_len[i]);
     }
 
+}
+
+int ijon_reg_to_addr(const char *reg_str) {
+  if (reg_str == NULL) return -1;
+
+  /* 可修改的拷贝以便 trim/upper 化 */
+  size_t len = strlen(reg_str);
+  char *buf = (char *)malloc(len + 1);
+  if (!buf) return -1;
+  memcpy(buf, reg_str, len + 1);
+
+  char *s = trim(buf);
+  if (!s || *s == '\0') { free(buf); return -1; }
+
+  /* 允许 AT&T 风格的前导 '%' */
+  if (s[0] == '%') s++;
+
+  /* 统一转大写（就地）*/
+  for (char *p = s; *p; ++p) *p = (char)toupper((unsigned char)*p);
+
+  /* 常见寄存器别名（RAX/EAX -> R_EAX 等） */
+  if (strcmp(s, "RAX") == 0 || strcmp(s, "EAX") == 0) { free(buf); return R_EAX; }
+  if (strcmp(s, "RCX") == 0 || strcmp(s, "ECX") == 0) { free(buf); return R_ECX; }
+  if (strcmp(s, "RDX") == 0 || strcmp(s, "EDX") == 0) { free(buf); return R_EDX; }
+  if (strcmp(s, "RBX") == 0 || strcmp(s, "EBX") == 0) { free(buf); return R_EBX; }
+  if (strcmp(s, "RSP") == 0 || strcmp(s, "ESP") == 0) { free(buf); return R_ESP; }
+  if (strcmp(s, "RBP") == 0 || strcmp(s, "EBP") == 0) { free(buf); return R_EBP; }
+  if (strcmp(s, "RSI") == 0 || strcmp(s, "ESI") == 0) { free(buf); return R_ESI; }
+  if (strcmp(s, "RDI") == 0 || strcmp(s, "EDI") == 0) { free(buf); return R_EDI; }
+
+  /* 检查 R8..R15（允许后缀，如 R12D、R12W、R12B） */
+  if (s[0] == 'R' && isdigit((unsigned char)s[1])) {
+    char *endptr = NULL;
+    long v = strtol(s + 1, &endptr, 10);
+    if (endptr != s + 1 && v >= 8 && v <= 15) {
+      free(buf);
+      return (int)v; /* enum R_R8..R_R15 对应数值 8..15 */
+    }
+  }
+
+  /* 直接数字形式 "0".."15" 也接受（有时配置中会用数字）*/
+  if (isdigit((unsigned char)s[0])) {
+    char *endptr = NULL;
+    long v = strtol(s, &endptr, 10);
+    if (endptr != s && v >= 0 && v <= 15) {
+      free(buf);
+      return (int)v;
+    }
+  }
+
+  free(buf);
+  return -1;
 }
 
 const char* ijon_to_str(IJON v) {

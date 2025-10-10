@@ -36,12 +36,13 @@ X(ijon_reset_state, ijon_reset_state)
 // 定义枚举（带 e_ 前缀）
 //
 typedef enum {
-  #define X(name, func) e_##name,
+#define X(name, func) e_##name,
   IJON_LIST
 #undef X
   e_IJON_COUNT
 } IJON;
 
+int ijon_reg_to_addr(const char *reg_str);
 const char* ijon_to_str(IJON v);
 IJON str_to_ijon(const char* str);
 void ijon_dispatch(IJON v, uint32_t addr, u64 val);
