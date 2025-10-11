@@ -36,12 +36,6 @@
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/selfmap.h"
-#include "qapi/qmp/qjson.h"  /* qobject_from_json() */
-#include "qapi/qmp/qdict.h"  /* QDict, qdict_first, qdict_next, qdict_get_try_str 等 */
-#include "qapi/qmp/qstring.h"/* qobject_to_qstring, qstring_get_str */
-#include "qapi/qmp/qlist.h"
-#include "qapi/qmp/qnum.h"
-#include "qapi/error.h"
 
 #if defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
 #include "hw/i386/apic.h"
@@ -199,14 +193,14 @@ static void collect_memory_snapshot(void) {
   if (afl_shm_id_str) {
     afl_shm_inode = atoi(afl_shm_id_str);
   }
-  
+
   size_t memory_snapshot_allocd = 32;
   if (!lkm_snapshot)
     memory_snapshot = malloc(memory_snapshot_allocd *
                              sizeof(struct saved_region));
 
   while ((read = getline(&line, &len, fp)) != -1) {
-  
+
     int fields, dev_maj, dev_min, inode;
     uint64_t min, max, offset;
     char flag_r, flag_w, flag_x, flag_p;
@@ -218,9 +212,9 @@ static void collect_memory_snapshot(void) {
 
     if ((fields < 10) || (fields > 11) || !h2g_valid(min))
         continue;
-    
+
     int flags = page_get_flags(h2g(min));
-    
+
     max = h2g_valid(max - 1) ? max : (uintptr_t)AFL_G2H(GUEST_ADDR_MAX) + 1;
     if (page_check_range(h2g(min), max - min, flags) == -1)
         continue;
@@ -231,9 +225,9 @@ static void collect_memory_snapshot(void) {
     if (afl_shm_id_str && inode == afl_shm_inode) continue;
 
     if (lkm_snapshot) {
-    
+
       afl_snapshot_include_vmrange((void*)min, (void*)max);
-    
+
     } else {
 
       if (!(flags & PROT_WRITE)) continue;
@@ -243,22 +237,22 @@ static void collect_memory_snapshot(void) {
         memory_snapshot = realloc(memory_snapshot, memory_snapshot_allocd *
                                   sizeof(struct saved_region));
       }
-      
+
       void* saved = malloc(max - min);
       memcpy(saved, (void*)min, max - min);
-      
+
       size_t i = memory_snapshot_len++;
       memory_snapshot[i].addr = (void*)min;
       memory_snapshot[i].size = max - min;
       memory_snapshot[i].saved = saved;
-    
+
     }
-    
+
   }
-  
+
   if (lkm_snapshot)
     afl_snapshot_take(AFL_SNAPSHOT_BLOCK | AFL_SNAPSHOT_FDS);
-    
+
   fclose(fp);
 
 }
@@ -266,25 +260,25 @@ static void collect_memory_snapshot(void) {
 static void restore_memory_snapshot(void) {
 
   afl_set_brk(saved_brk);
-  
+
   if (lkm_snapshot) {
-  
+
     afl_snapshot_restore();
-  
+
   } else {
-  
+
     size_t i;
     for (i = 0; i < memory_snapshot_len; ++i) {
-    
+
       // TODO avoid munmap of snapshot pages
-      
+
       memcpy(memory_snapshot[i].addr, memory_snapshot[i].saved,
              memory_snapshot[i].size);
-    
+
     }
-  
+
   }
-  
+
   afl_target_unmap_trackeds();
 
 }
@@ -308,21 +302,20 @@ target_ulong g_var_addr[0x1000];
 uint32_t g_var_len[0x1000];
 uint32_t ijon_type[0x1000];
 
-/* 读取整个文件到 malloc 的缓冲区（调用者负责 free） */
 static ssize_t read_file_all(const char *path, char **out_buf) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
-    long sz = ftell(f);
-    if (sz < 0) { fclose(f); return -1; }
-    rewind(f);
-    char *buf = g_malloc(sz + 1);
-    if (!buf) { fclose(f); return -1; }
-    size_t r = fread(buf, 1, sz, f);
-    fclose(f);
-    buf[r] = '\0';
-    *out_buf = buf;
-    return (ssize_t)r;
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  long sz = ftell(f);
+  if (sz < 0) { fclose(f); return -1; }
+  rewind(f);
+  char *buf = g_malloc(sz + 1);
+  if (!buf) { fclose(f); return -1; }
+  size_t r = fread(buf, 1, sz, f);
+  fclose(f);
+  buf[r] = '\0';
+  *out_buf = buf;
+  return (ssize_t)r;
 }
 
 static char *trim(char *s) {
@@ -342,11 +335,103 @@ static int parse_uint64_str(const char *s, target_ulong *out) {
   if (!s || !*s) return -1;
   errno = 0;
   char *endp = NULL;
-  unsigned long long val = strtoull(s, &endp, 0); // base 0 自动识别 0x
+  unsigned long long val = strtoull(s, &endp, 0);
   if (endp == s) return -1; // no conversion
   if (errno == ERANGE) return -1;
+  // allow 0x123abc, not allow 123abc
+  if (*endp != '\0') return -1;
   *out = (target_ulong)val;
   return 0;
+}
+
+// Helper macro for consistent error reporting
+#define IJON_PARSE_ERROR(line_num, original_line, format, ...) \
+  do { \
+    fprintf(stderr, "ijon: Parse error on line %d: " format "\n", line_num, ##__VA_ARGS__); \
+    fprintf(stderr, "       -> Content: \"%s\"\n", original_line); \
+    exit(-1); \
+  } while (0)
+
+/**
+ * Parses a single, non-empty, non-comment line from the config file.
+ * On any error, it prints a message and terminates the program.
+ * On success, it populates the out_entry struct.
+ */
+static void parse_ijon_line(const char *line, int line_num) {
+  char *fields[4];
+  int field_count = 0;
+
+  // Create a mutable copy for parsing
+  char *line_copy = strdup(line);
+  if (!line_copy) {
+    fprintf(stderr, "ijon: Out of memory\n");
+    exit(-1);
+  }
+
+  char *p = line_copy;
+  while(field_count < 4) {
+    char *start = p;
+    char *end = strchr(start, ',');
+
+    if (end) {
+      *end = '\0';
+      p = end + 1;
+    }
+
+    fields[field_count++] = trim(start);
+
+    if (!end) break; // Reached the last part
+  }
+
+  if (field_count != 4) {
+    free(line_copy);
+    IJON_PARSE_ERROR(line_num, line, "Expected 4 comma-separated fields, but found %d", field_count);
+  }
+
+  // --- Field 1: Code Address ---
+  if (parse_uint64_str(fields[0], &hook_code_addr[ijon_hooker_cnt]) != 0) {
+    IJON_PARSE_ERROR(line_num, line, "Invalid code address in field 1. Value: '%s'", fields[0]);
+  }
+
+  // --- Field 2: Ijon Method ---
+  ijon_type[ijon_hooker_cnt] = str_to_ijon(fields[1]);
+  if (ijon_type[ijon_hooker_cnt] == -1) {
+    IJON_PARSE_ERROR(line_num, line, "Unknown ijon method in field 2. Value: '%s'", fields[1]);
+  }
+
+  // --- Field 3: Variable Address or Register Name ---
+  if (isdigit((unsigned char)*fields[2]) || (strncmp(fields[2], "0x", 2) == 0)) {
+
+    if (parse_uint64_str(fields[2], &g_var_addr[ijon_hooker_cnt]) != 0) {
+      IJON_PARSE_ERROR(line_num, line, "Invalid variable address in field 3. Value: '%s'", fields[2]);
+    }
+
+  } else {
+
+    g_var_addr[ijon_hooker_cnt] = ijon_reg_to_addr(fields[2]);
+    if (g_var_addr[ijon_hooker_cnt] == 0) {
+      IJON_PARSE_ERROR(line_num, line, "Invalid register name in field 3. Value: '%s'", fields[2]);
+    }
+
+  }
+
+  // --- Field 4: Variable Length ---
+  errno = 0;
+  char *endp = NULL;
+  unsigned long len = strtoul(fields[3], &endp, 0);
+  if (endp == fields[3] || *endp != '\0' || errno == ERANGE) {
+    IJON_PARSE_ERROR(line_num, line, "Invalid variable length in field 4. Value: '%s'", fields[3]);
+  }
+  g_var_len[ijon_hooker_cnt] = (uint32_t)len;
+
+  if (len > 8) {
+    fprintf(stderr, "ijon: Variables larger than 8 bytes are not supported: %s\n", fields[3]);
+    exit(-1);
+  }
+
+  ijon_hooker_cnt++;
+
+  free(line_copy);
 }
 
 /* Parse the ijon configuration file, which stores the following data structure:
@@ -355,107 +440,47 @@ static int parse_uint64_str(const char *s, target_ulong *out) {
  * code addr, ijon method, var addr/reg, var len
  */
 static void qemu_ijon_init(void) {
-    const char *path = getenv("AFL_QEMU_IJON");
-    use_ijon = !!path;
-    if (!use_ijon) return;
+  const char *path = getenv("AFL_QEMU_IJON");
+  use_ijon = !!path;
+  if (!use_ijon) return;
 
-    char *buf = NULL;
-    ssize_t buf_len = read_file_all(path, &buf);
-    if (buf_len < 0) {
-        fprintf(stderr, "ijon: cannot read '%s'\n", path ? path : "(null)");
-        exit(-1);
+  char *buf = NULL;
+  ssize_t buf_len = read_file_all(path, &buf);
+  if (buf_len < 0) {
+    fprintf(stderr, "ijon: cannot read '%s'\n", path ? path : "(null)");
+    exit(-1);
+  }
+
+  // strtok_r modifies the buffer, so we operate on a copy.
+  char *buf_copy = malloc(buf_len + 1);
+  if (!buf_copy) {
+    fprintf(stderr, "ijon: failed to allocate memory\n");
+    free(buf);
+    exit(-1);
+  }
+  memcpy(buf_copy, buf, buf_len);
+  buf_copy[buf_len] = '\0';
+  free(buf); // Original buffer no longer needed
+
+  char *line_ctx;
+  char *line = strtok_r(buf_copy, "\n", &line_ctx);
+  int line_num = 1;
+
+  while (line && ijon_hooker_cnt < 0x1000) {
+    char *trimmed_line = trim(line);
+    if (*trimmed_line != '\0' && *trimmed_line != '#') {
+      parse_ijon_line(trimmed_line, line_num);
     }
+    line = strtok_r(NULL, "\n", &line_ctx);
+    line_num++;
+  }
 
-    char *buf_copy = malloc(buf_len + 1);
-    if (!buf_copy) exit(-1);
-    memcpy(buf_copy, buf, buf_len);
-    buf_copy[buf_len] = '\0';
+  free(buf_copy);
 
-    char *line_ctx;
-    char *line = strtok_r(buf_copy, "\n", &line_ctx);
-    while (line && ijon_hooker_cnt < 0x1000) {
-        char *s = trim(line);
-        if (*s == '\0') { line = strtok_r(NULL, "\n", &line_ctx); continue; } // 空行
-        if (*s == '#') { line = strtok_r(NULL, "\n", &line_ctx); continue; }   // 注释行
-
-        // 分割 4 个字段（允许字段中间有空白）
-        // 采用手动查找逗号，避免 strtok 在字段内容含逗号时出问题（这里不考虑字段含逗号）
-        char *f1 = s;
-        char *p = strchr(s, ',');
-        if (!p) { line = strtok_r(NULL, "\n", &line_ctx); continue; } // 格式错误，跳过
-        *p = '\0'; char *f2 = trim(p + 1);
-
-        // next comma
-        p = strchr(f2, ',');
-        if (!p) { line = strtok_r(NULL, "\n", &line_ctx); continue; }
-        *p = '\0'; char *f3 = trim(p + 1);
-
-        // last comma
-        p = strchr(f3, ',');
-        if (!p) { line = strtok_r(NULL, "\n", &line_ctx); continue; }
-        *p = '\0'; char *f4 = trim(p + 1);
-
-        f1 = trim(f1);
-        f2 = trim(f2);
-        f3 = trim(f3);
-        f4 = trim(f4);
-
-        // 解析每个字段，任一失败则跳过该行
-        int ok = 1;
-
-        // field1 -> hook_code_addr[ijon_hooker_cnt]
-        target_ulong addr0;
-        if (parse_uint64_str(f1, &addr0) != 0) { ok = 0; }
-
-        // field2 -> ijon_type[ijon_hooker_cnt] via str_to_ijon
-        uint32_t type2 = str_to_ijon(f2);
-        if (type2 == -1) { ok = 0; }
-
-        // field3 -> g_var_addr[ijon_hooker_cnt] : numeric -> addr, string -> convert via str_to_ijon_reg (enum -> store as target_ulong)
-        target_ulong gaddr = 0;
-        if (ok) {
-            // 判断是否以数字开头或以 0x 开头或全数字（允许带负号? 这里假设不带）
-            int looks_like_number = 0;
-            const char *t = f3;
-            if (*t == '0' && (t[1]=='x' || t[1]=='X')) looks_like_number = 1;
-            else if (isdigit((unsigned char)*t)) looks_like_number = 1;
-
-            if (looks_like_number) {
-                if (parse_uint64_str(f3, &gaddr) != 0) ok = 0;
-            } else {
-                uint32_t reg_enum = ijon_reg_to_addr(f3);
-                if (reg_enum == -1) ok = 0;
-                else {
-                  CPUArchState* env = first_cpu->env_ptr;
-                  gaddr = &env->regs[reg_enum];
-                }
-            }
-        }
-
-        // field4 -> g_var_len[ijon_hooker_cnt]
-        uint32_t len4 = 0;
-        if (ok) {
-            errno = 0;
-            char *endp = NULL;
-            unsigned long v = strtoul(f4, &endp, 0);
-            if (endp == f4 || errno == ERANGE) ok = 0;
-            else len4 = (uint32_t)v;
-        }
-
-        if (ok) {
-            hook_code_addr[ijon_hooker_cnt] = addr0;
-            ijon_type[ijon_hooker_cnt] = type2;
-            g_var_addr[ijon_hooker_cnt] = gaddr;
-            g_var_len[ijon_hooker_cnt] = len4;
-            ijon_hooker_cnt++;
-        } else {
-            // skip
-        }
-
-        line = strtok_r(NULL, "\n", &line_ctx);
-    }
-
-    free(buf_copy);
+  if (ijon_hooker_cnt == 0) {
+    fprintf(stderr, "ijon: You specified the AFL_QEMU_IJON file, but no valid entries were found.\n");
+    exit(-1);
+  }
 
     fprintf(stderr, "ijon: loaded %u mappings\n", ijon_hooker_cnt);
     for (uint32_t i = 0; i < ijon_hooker_cnt; i++) {
@@ -465,59 +490,64 @@ static void qemu_ijon_init(void) {
                 (unsigned long)g_var_addr[i],
                 (unsigned)g_var_len[i]);
     }
-
 }
 
-int ijon_reg_to_addr(const char *reg_str) {
-  if (reg_str == NULL) return -1;
+void* ijon_reg_to_addr(const char *reg_str) {
+  if (reg_str == NULL) return NULL;
 
-  /* 可修改的拷贝以便 trim/upper 化 */
-  size_t len = strlen(reg_str);
-  char *buf = (char *)malloc(len + 1);
-  if (!buf) return -1;
-  memcpy(buf, reg_str, len + 1);
+  /* copy for upper  */
+  char *s = strdup(reg_str);
+  if (!s || *s == '\0') { free(s); return NULL; }
 
-  char *s = trim(buf);
-  if (!s || *s == '\0') { free(buf); return -1; }
-
-  /* 允许 AT&T 风格的前导 '%' */
+  /* allow AT&T style '%' */
   if (s[0] == '%') s++;
 
-  /* 统一转大写（就地）*/
+  /* convert to uppercase */
   for (char *p = s; *p; ++p) *p = (char)toupper((unsigned char)*p);
 
-  /* 常见寄存器别名（RAX/EAX -> R_EAX 等） */
-  if (strcmp(s, "RAX") == 0 || strcmp(s, "EAX") == 0) { free(buf); return R_EAX; }
-  if (strcmp(s, "RCX") == 0 || strcmp(s, "ECX") == 0) { free(buf); return R_ECX; }
-  if (strcmp(s, "RDX") == 0 || strcmp(s, "EDX") == 0) { free(buf); return R_EDX; }
-  if (strcmp(s, "RBX") == 0 || strcmp(s, "EBX") == 0) { free(buf); return R_EBX; }
-  if (strcmp(s, "RSP") == 0 || strcmp(s, "ESP") == 0) { free(buf); return R_ESP; }
-  if (strcmp(s, "RBP") == 0 || strcmp(s, "EBP") == 0) { free(buf); return R_EBP; }
-  if (strcmp(s, "RSI") == 0 || strcmp(s, "ESI") == 0) { free(buf); return R_ESI; }
-  if (strcmp(s, "RDI") == 0 || strcmp(s, "EDI") == 0) { free(buf); return R_EDI; }
 
-  /* 检查 R8..R15（允许后缀，如 R12D、R12W、R12B） */
+#ifdef TARGET_X86_64
+  CPUX86State* env = first_cpu->env_ptr;
+  if (strcmp(s, "RAX") == 0 || strcmp(s, "EAX") == 0) {  return &env->regs[R_EAX]; }
+  if (strcmp(s, "RCX") == 0 || strcmp(s, "ECX") == 0) {  return &env->regs[R_ECX]; }
+  if (strcmp(s, "RDX") == 0 || strcmp(s, "EDX") == 0) {  return &env->regs[R_EDX]; }
+  if (strcmp(s, "RBX") == 0 || strcmp(s, "EBX") == 0) {  return &env->regs[R_EBX]; }
+  if (strcmp(s, "RSP") == 0 || strcmp(s, "ESP") == 0) {  return &env->regs[R_ESP]; }
+  if (strcmp(s, "RBP") == 0 || strcmp(s, "EBP") == 0) {  return &env->regs[R_EBP]; }
+  if (strcmp(s, "RSI") == 0 || strcmp(s, "ESI") == 0) {  return &env->regs[R_ESI]; }
+  if (strcmp(s, "RDI") == 0 || strcmp(s, "EDI") == 0) {  return &env->regs[R_EDI]; }
+
+  /* convert R8..R15 , allow R12D,R12W,R12 etc */
   if (s[0] == 'R' && isdigit((unsigned char)s[1])) {
     char *endptr = NULL;
     long v = strtol(s + 1, &endptr, 10);
-    if (endptr != s + 1 && v >= 8 && v <= 15) {
-      free(buf);
-      return (int)v; /* enum R_R8..R_R15 对应数值 8..15 */
+    if (v >= 8 && v <= 15) {
+      return &env->regs[v]; /* enum R_R8..R_R15 -> 8..15 */
     }
   }
 
-  /* 直接数字形式 "0".."15" 也接受（有时配置中会用数字）*/
-  if (isdigit((unsigned char)s[0])) {
+#endif
+
+#if defined(TARGET_AARCH64) || defined(TARGET_ARM)
+  CPUARMState* env = first_cpu->env_ptr;
+  if ((s[0] == 'X' || s[0] == 'W') && isdigit((unsigned char)s[1])) {
     char *endptr = NULL;
-    long v = strtol(s, &endptr, 10);
-    if (endptr != s && v >= 0 && v <= 15) {
-      free(buf);
-      return (int)v;
+    long v = strtol(s + 1, &endptr, 10);
+    if (v >= 0 && v <= 31) {
+      return &env->xregs[v];
     }
   }
 
-  free(buf);
-  return -1;
+  if (s[0] == 'R' && isdigit((unsigned char)s[1])) {
+    char *endptr = NULL;
+    long v = strtol(s + 1, &endptr, 10);
+    if (v >= 0 && v <= 15) {
+      return &env->regs[v];
+    }
+  }
+#endif
+
+  return NULL;
 }
 
 const char* ijon_to_str(IJON v) {
@@ -880,7 +910,7 @@ void afl_setup(void) {
     if (inst_r) afl_area_ptr[0] = 1;
 
   }
-  
+
   disable_caching = getenv("AFL_QEMU_DISABLE_CACHE") != NULL;
 
   if (getenv("___AFL_EINS_ZWEI_POLIZEI___")) {  // CmpLog forkserver
@@ -905,7 +935,7 @@ void afl_setup(void) {
     afl_end_code = (abi_ulong)-1;
 
   }
-  
+
   if (getenv("AFL_CODE_START"))
     afl_start_code = strtoll(getenv("AFL_CODE_START"), NULL, 16);
   if (getenv("AFL_CODE_END"))
@@ -916,17 +946,17 @@ void afl_setup(void) {
     char *str = getenv("AFL_QEMU_INST_RANGES");
     char *saveptr1, *saveptr2 = NULL, *save_pt1 = NULL;
     char *pt1, *pt2, *pt3 = NULL;
-    
+
     while (1) {
 
       pt1 = strtok_r(str, ",", &saveptr1);
       if (pt1 == NULL) break;
       str = NULL;
       save_pt1 = strdup(pt1);
-      
+
       pt2 = strtok_r(pt1, "-", &saveptr2);
       pt3 = strtok_r(NULL, "-", &saveptr2);
-      
+
       struct vmrange* n = calloc(1, sizeof(struct vmrange));
       n->next = afl_instr_code;
 
@@ -948,7 +978,7 @@ void afl_setup(void) {
           n->name = save_pt1;
         }
       }
-      
+
       afl_instr_code = n;
 
     }
@@ -1061,7 +1091,7 @@ void afl_setup(void) {
      behaviour, and seems to work alright? */
 
   rcu_disable_atfork();
-  
+
   if (getenv("AFL_QEMU_PERSISTENT_HOOK")) {
 
 #ifdef AFL_QEMU_STATIC_BUILD
@@ -1104,9 +1134,9 @@ void afl_setup(void) {
 #endif
 
   }
-  
+
   if (__afl_cmp_map) return; // no persistent for cmplog
-  
+
   is_persistent = getenv("AFL_QEMU_PERSISTENT_ADDR") != NULL;
 
   if (is_persistent)
@@ -1129,28 +1159,28 @@ void afl_setup(void) {
     afl_persistent_cnt = strtoll(getenv("AFL_QEMU_PERSISTENT_CNT"), NULL, 0);
   else
     afl_persistent_cnt = 0;
-    
+
   if (getenv("AFL_QEMU_PERSISTENT_EXITS")) persistent_exits = 1;
 
   // TODO persistent exits for other archs not x86
   // TODO persistent mode for other archs not x86
   // TODO cmplog rtn for arm
-  
+
   if (getenv("AFL_QEMU_SNAPSHOT")) {
-  
+
     is_persistent = 1;
     persistent_save_gpr = 1;
     persistent_memory = 1;
     persistent_exits = 1;
-    
+
     if (afl_persistent_addr == 0)
       afl_persistent_addr = strtoll(getenv("AFL_QEMU_SNAPSHOT"), NULL, 0);
-  
+
   }
-  
+
   if (persistent_memory && afl_snapshot_init() >= 0)
     lkm_snapshot = 1;
-  
+
   if (getenv("AFL_DEBUG")) {
     if (is_persistent)
       fprintf(stderr, "Persistent: 0x%lx [0x%lx] %s%s%s\n",
@@ -1358,15 +1388,15 @@ void afl_persistent_iter(CPUArchState *env) {
   static struct afl_tsl exit_cmd_tsl;
 
   if (!afl_persistent_cnt || --cycle_cnt) {
-  
+
     if (persistent_memory) restore_memory_snapshot();
-  
+
     if (persistent_save_gpr && !afl_persistent_hook_ptr) {
       afl_restore_regs(&saved_regs, env);
     }
 
     if (!disable_caching) {
-  
+
       memset(&exit_cmd_tsl, 0, sizeof(struct afl_tsl));
       exit_cmd_tsl.tb.pc = (target_ulong)(-1);
 
@@ -1378,16 +1408,16 @@ void afl_persistent_iter(CPUArchState *env) {
         exit(0);
 
       }
-    
+
     }
 
     // TODO use only pipe
     raise(SIGSTOP);
 
-    
+
     // now we have shared_buf updated and ready to use
     if (persistent_save_gpr && afl_persistent_hook_ptr) {
-    
+
       struct api_regs hook_regs = saved_regs;
       afl_persistent_hook_ptr(&hook_regs, guest_base, shared_buf,
                               *shared_buf_len);
@@ -1425,15 +1455,15 @@ void afl_persistent_loop(CPUArchState *env) {
       afl_prev_loc = 0;
 
     }
-    
+
     if (persistent_memory) collect_memory_snapshot();
-    
+
     if (persistent_save_gpr) {
-    
+
       afl_save_regs(&saved_regs, env);
-      
+
       if (afl_persistent_hook_ptr) {
-      
+
         struct api_regs hook_regs = saved_regs;
         afl_persistent_hook_ptr(&hook_regs, guest_base, shared_buf,
                                 *shared_buf_len);
@@ -1442,7 +1472,7 @@ void afl_persistent_loop(CPUArchState *env) {
       }
 
     }
-    
+
     cycle_cnt = afl_persistent_cnt;
     persistent_first_pass = 0;
     persistent_stack_offset = TARGET_LONG_BITS / 8;
@@ -1489,7 +1519,7 @@ static void afl_request_tsl(target_ulong pc, target_ulong cb, uint32_t flags,
     t.chain.tb_exit = tb_exit;
 
   }
-  
+
   if (write(TSL_FD, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
     return;
 
