@@ -44,4 +44,22 @@ const char* ijon_to_str(IJON v);
 IJON str_to_ijon(const char* str);
 void ijon_dispatch(IJON v, uint32_t addr, u64 val);
 
+#define INSTALL_IJON_HOOKS() \
+do { \
+  for (int i = 0; i < ijon_hooker_cnt; i++) { \
+    if (dc->base.pc_next == hook_code_addr[i]) { \
+      TCGv var_addr = tcg_const_tl(g_var_addr[i]); \
+      TCGv var_len  = tcg_const_tl(g_var_len[i]); \
+      TCGv itype    = tcg_const_tl(ijon_type[i]); \
+      TCGv idx      = tcg_const_tl(i); \
+      gen_helper_ijon_func_call(var_addr, var_len, itype, idx); \
+      fprintf(stderr, "install ijon hook in %lx\n", hook_code_addr[i]); \
+      tcg_temp_free(var_addr); \
+      tcg_temp_free(var_len); \
+      tcg_temp_free(itype); \
+      tcg_temp_free(idx); \
+    } \
+  } \
+} while (0)
+
 #endif //QEMUAFL_QEMU_IJON_SUPPORT_H
