@@ -39,6 +39,8 @@
 
 #include "qemuafl/cpu-translate.h"
 
+#include "qemuafl/qemu-ijon-support.h"
+
 // TODO QASAN shadow stack
 //#include "qemuafl/qasan-qemu.h"
 
@@ -9297,7 +9299,9 @@ static void arm_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     dc->pc_curr = dc->base.pc_next;
 
     AFL_QEMU_TARGET_ARM_SNIPPET
-    
+
+    INSTALL_IJON_HOOKS();
+
     insn = arm_ldl_code(env, dc->base.pc_next, dc->sctlr_b);
     dc->insn = insn;
     dc->base.pc_next += 4;

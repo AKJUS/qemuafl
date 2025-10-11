@@ -357,3 +357,5 @@ DEF_HELPER_FLAGS_2(qasan_store4, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_2(qasan_store8, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_1(qasan_shadow_stack_push, TCG_CALL_NO_RWG, void, tl)
 DEF_HELPER_FLAGS_1(qasan_shadow_stack_pop, TCG_CALL_NO_RWG, void, tl)
+
+DEF_HELPER_FLAGS_4(ijon_func_call, TCG_CALL_NO_RWG, void, tl, tl, tl, tl)

@@ -41,7 +41,7 @@
 
 #include "qemuafl/cpu-translate.h"
 #include "qemuafl/qasan-qemu.h"
-
+#include "qemuafl/qemu-ijon-support.h"
 // SP = 31, LINK = 30
 
 #define AFL_QEMU_TARGET_ARM64_SNIPPET                                         \
@@ -14876,6 +14876,8 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     CPUARMState *env = cpu->env_ptr;
+
+    INSTALL_IJON_HOOKS();
 
     if (dc->ss_active && !dc->pstate_ss) {
         /* Singlestep state is Active-pending.

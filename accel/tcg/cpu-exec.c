@@ -36,6 +36,7 @@
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/selfmap.h"
+
 #if defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
 #include "hw/i386/apic.h"
 #endif
@@ -47,6 +48,7 @@
 
 #include "qemuafl/common.h"
 #include "qemuafl/imported/snapshot-inl.h"
+#include "qemuafl/qemu-ijon-support.h"
 
 #include <string.h>
 #include <sys/shm.h>
@@ -191,14 +193,14 @@ static void collect_memory_snapshot(void) {
   if (afl_shm_id_str) {
     afl_shm_inode = atoi(afl_shm_id_str);
   }
-  
+
   size_t memory_snapshot_allocd = 32;
   if (!lkm_snapshot)
     memory_snapshot = malloc(memory_snapshot_allocd *
                              sizeof(struct saved_region));
 
   while ((read = getline(&line, &len, fp)) != -1) {
-  
+
     int fields, dev_maj, dev_min, inode;
     uint64_t min, max, offset;
     char flag_r, flag_w, flag_x, flag_p;
@@ -210,9 +212,9 @@ static void collect_memory_snapshot(void) {
 
     if ((fields < 10) || (fields > 11) || !h2g_valid(min))
         continue;
-    
+
     int flags = page_get_flags(h2g(min));
-    
+
     max = h2g_valid(max - 1) ? max : (uintptr_t)AFL_G2H(GUEST_ADDR_MAX) + 1;
     if (page_check_range(h2g(min), max - min, flags) == -1)
         continue;
@@ -223,9 +225,9 @@ static void collect_memory_snapshot(void) {
     if (afl_shm_id_str && inode == afl_shm_inode) continue;
 
     if (lkm_snapshot) {
-    
+
       afl_snapshot_include_vmrange((void*)min, (void*)max);
-    
+
     } else {
 
       if (!(flags & PROT_WRITE)) continue;
@@ -235,22 +237,22 @@ static void collect_memory_snapshot(void) {
         memory_snapshot = realloc(memory_snapshot, memory_snapshot_allocd *
                                   sizeof(struct saved_region));
       }
-      
+
       void* saved = malloc(max - min);
       memcpy(saved, (void*)min, max - min);
-      
+
       size_t i = memory_snapshot_len++;
       memory_snapshot[i].addr = (void*)min;
       memory_snapshot[i].size = max - min;
       memory_snapshot[i].saved = saved;
-    
+
     }
-    
+
   }
-  
+
   if (lkm_snapshot)
     afl_snapshot_take(AFL_SNAPSHOT_BLOCK | AFL_SNAPSHOT_FDS);
-    
+
   fclose(fp);
 
 }
@@ -258,26 +260,583 @@ static void collect_memory_snapshot(void) {
 static void restore_memory_snapshot(void) {
 
   afl_set_brk(saved_brk);
-  
+
   if (lkm_snapshot) {
-  
+
     afl_snapshot_restore();
-  
+
   } else {
-  
+
     size_t i;
     for (i = 0; i < memory_snapshot_len; ++i) {
-    
+
       // TODO avoid munmap of snapshot pages
-      
+
       memcpy(memory_snapshot[i].addr, memory_snapshot[i].saved,
              memory_snapshot[i].size);
-    
+
     }
-  
+
   }
-  
+
   afl_target_unmap_trackeds();
+
+}
+
+static int use_ijon = 0;
+static unsigned char *ijon_map_ptr = dummy;
+static unsigned char *ijon_max_ptr = dummy;
+
+/* IJON state tracking globals */
+#if defined(__ANDROID__) || defined(__HAIKU__) || defined(NO_TLS)
+u32 __afl_ijon_state = 0;      // Current IJON state
+u32 __afl_ijon_state_log = 0;  // State history log
+#else
+__thread u32 __afl_ijon_state = 0;
+__thread u32 __afl_ijon_state_log = 0;
+#endif
+
+uint32_t ijon_hooker_cnt = 0;
+target_ulong hook_code_addr[0x1000];
+target_ulong g_var_addr[0x1000];
+uint32_t g_var_len[0x1000];
+uint32_t ijon_type[0x1000];
+
+static ssize_t read_file_all(const char *path, char **out_buf) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  long sz = ftell(f);
+  if (sz < 0) { fclose(f); return -1; }
+  rewind(f);
+  char *buf = g_malloc(sz + 1);
+  if (!buf) { fclose(f); return -1; }
+  size_t r = fread(buf, 1, sz, f);
+  fclose(f);
+  buf[r] = '\0';
+  *out_buf = buf;
+  return (ssize_t)r;
+}
+
+static char *trim(char *s) {
+  if (!s) return s;
+  // left
+  while (*s && isspace((unsigned char)*s)) s++;
+  if (*s == 0) return s;
+  // right
+  char *end = s + strlen(s) - 1;
+  while (end > s && isspace((unsigned char)*end)) { *end = '\0'; end--; }
+  return s;
+}
+
+// parse unsigned integer (hex if 0x prefix, or decimal)
+// returns 0 on success, non-zero on failure
+static int parse_uint64_str(const char *s, target_ulong *out) {
+  if (!s || !*s) return -1;
+  errno = 0;
+  char *endp = NULL;
+  unsigned long long val = strtoull(s, &endp, 0);
+  if (endp == s) return -1; // no conversion
+  if (errno == ERANGE) return -1;
+  // allow 0x123abc, not allow 123abc
+  if (*endp != '\0') return -1;
+  *out = (target_ulong)val;
+  return 0;
+}
+
+// Helper macro for consistent error reporting
+#define IJON_PARSE_ERROR(line_num, original_line, format, ...) \
+  do { \
+    fprintf(stderr, "ijon: Parse error on line %d: " format "\n", line_num, ##__VA_ARGS__); \
+    fprintf(stderr, "       -> Content: \"%s\"\n", original_line); \
+    exit(-1); \
+  } while (0)
+
+/**
+ * Parses a single, non-empty, non-comment line from the config file.
+ * On any error, it prints a message and terminates the program.
+ * On success, it populates the out_entry struct.
+ */
+static void parse_ijon_line(const char *line, int line_num) {
+  char *fields[4];
+  int field_count = 0;
+
+  // Create a mutable copy for parsing
+  char *line_copy = strdup(line);
+  if (!line_copy) {
+    fprintf(stderr, "ijon: Out of memory\n");
+    exit(-1);
+  }
+
+  char *p = line_copy;
+  while(field_count < 4) {
+    char *start = p;
+    char *end = strchr(start, ',');
+
+    if (end) {
+      *end = '\0';
+      p = end + 1;
+    }
+
+    fields[field_count++] = trim(start);
+
+    if (!end) break; // Reached the last part
+  }
+
+  if (field_count != 4) {
+    free(line_copy);
+    IJON_PARSE_ERROR(line_num, line, "Expected 4 comma-separated fields, but found %d", field_count);
+  }
+
+  // --- Field 1: Code Address ---
+  if (parse_uint64_str(fields[0], &hook_code_addr[ijon_hooker_cnt]) != 0) {
+    IJON_PARSE_ERROR(line_num, line, "Invalid code address in field 1. Value: '%s'", fields[0]);
+  }
+
+  // --- Field 2: Ijon Method ---
+  ijon_type[ijon_hooker_cnt] = str_to_ijon(fields[1]);
+  if (ijon_type[ijon_hooker_cnt] == -1) {
+    IJON_PARSE_ERROR(line_num, line, "Unknown ijon method in field 2. Value: '%s'", fields[1]);
+  }
+
+  // --- Field 3: Variable Address or Register Name ---
+  if (isdigit((unsigned char)*fields[2]) || (strncmp(fields[2], "0x", 2) == 0)) {
+
+    if (parse_uint64_str(fields[2], &g_var_addr[ijon_hooker_cnt]) != 0) {
+      IJON_PARSE_ERROR(line_num, line, "Invalid variable address in field 3. Value: '%s'", fields[2]);
+    }
+
+  } else {
+
+    g_var_addr[ijon_hooker_cnt] = ijon_reg_to_addr(fields[2]);
+    if (g_var_addr[ijon_hooker_cnt] == 0) {
+      IJON_PARSE_ERROR(line_num, line, "Invalid register name in field 3. Value: '%s'", fields[2]);
+    }
+
+  }
+
+  // --- Field 4: Variable Length ---
+  errno = 0;
+  char *endp = NULL;
+  unsigned long len = strtoul(fields[3], &endp, 0);
+  if (endp == fields[3] || *endp != '\0' || errno == ERANGE) {
+    IJON_PARSE_ERROR(line_num, line, "Invalid variable length in field 4. Value: '%s'", fields[3]);
+  }
+  g_var_len[ijon_hooker_cnt] = (uint32_t)len;
+
+  if (len > 8) {
+    fprintf(stderr, "ijon: Variables larger than 8 bytes are not supported: %s\n", fields[3]);
+    exit(-1);
+  }
+
+  ijon_hooker_cnt++;
+
+  free(line_copy);
+}
+
+/* Parse the ijon configuration file, which stores the following data structure:
+ * 0x4001200,ijon_set,0x4000005064,8
+ * 0x40012bb,ijon_min,RAX,4
+ * code addr, ijon method, var addr/reg, var len
+ */
+static void qemu_ijon_init(void) {
+  const char *path = getenv("AFL_QEMU_IJON");
+  use_ijon = !!path;
+  if (!use_ijon) return;
+
+  char *buf = NULL;
+  ssize_t buf_len = read_file_all(path, &buf);
+  if (buf_len < 0) {
+    fprintf(stderr, "ijon: cannot read '%s'\n", path ? path : "(null)");
+    exit(-1);
+  }
+
+  // strtok_r modifies the buffer, so we operate on a copy.
+  char *buf_copy = malloc(buf_len + 1);
+  if (!buf_copy) {
+    fprintf(stderr, "ijon: failed to allocate memory\n");
+    free(buf);
+    exit(-1);
+  }
+  memcpy(buf_copy, buf, buf_len);
+  buf_copy[buf_len] = '\0';
+  free(buf); // Original buffer no longer needed
+
+  char *line_ctx;
+  char *line = strtok_r(buf_copy, "\n", &line_ctx);
+  int line_num = 1;
+
+  while (line && ijon_hooker_cnt < 0x1000) {
+    char *trimmed_line = trim(line);
+    if (*trimmed_line != '\0' && *trimmed_line != '#') {
+      parse_ijon_line(trimmed_line, line_num);
+    }
+    line = strtok_r(NULL, "\n", &line_ctx);
+    line_num++;
+  }
+
+  free(buf_copy);
+
+  if (ijon_hooker_cnt == 0) {
+    fprintf(stderr, "ijon: You specified the AFL_QEMU_IJON file, but no valid entries were found.\n");
+    exit(-1);
+  }
+
+    fprintf(stderr, "ijon: loaded %u mappings\n", ijon_hooker_cnt);
+    for (uint32_t i = 0; i < ijon_hooker_cnt; i++) {
+        fprintf(stderr, "ijon[%u]: hook=0x%lx type=%s var=0x%lx len=%u\n",
+                i, (unsigned long)hook_code_addr[i],
+                ijon_to_str(ijon_type[i]),
+                (unsigned long)g_var_addr[i],
+                (unsigned)g_var_len[i]);
+    }
+}
+
+void* ijon_reg_to_addr(const char *reg_str) {
+  if (reg_str == NULL) return NULL;
+
+  /* copy for upper  */
+  char *s = strdup(reg_str);
+  if (!s || *s == '\0') { free(s); return NULL; }
+
+  /* allow AT&T style '%' */
+  if (s[0] == '%') s++;
+
+  /* convert to uppercase */
+  for (char *p = s; *p; ++p) *p = (char)toupper((unsigned char)*p);
+
+
+#ifdef TARGET_X86_64
+  CPUX86State* env = first_cpu->env_ptr;
+  if (strcmp(s, "RAX") == 0 || strcmp(s, "EAX") == 0) {  return &env->regs[R_EAX]; }
+  if (strcmp(s, "RCX") == 0 || strcmp(s, "ECX") == 0) {  return &env->regs[R_ECX]; }
+  if (strcmp(s, "RDX") == 0 || strcmp(s, "EDX") == 0) {  return &env->regs[R_EDX]; }
+  if (strcmp(s, "RBX") == 0 || strcmp(s, "EBX") == 0) {  return &env->regs[R_EBX]; }
+  if (strcmp(s, "RSP") == 0 || strcmp(s, "ESP") == 0) {  return &env->regs[R_ESP]; }
+  if (strcmp(s, "RBP") == 0 || strcmp(s, "EBP") == 0) {  return &env->regs[R_EBP]; }
+  if (strcmp(s, "RSI") == 0 || strcmp(s, "ESI") == 0) {  return &env->regs[R_ESI]; }
+  if (strcmp(s, "RDI") == 0 || strcmp(s, "EDI") == 0) {  return &env->regs[R_EDI]; }
+
+  /* convert R8..R15 , allow R12D,R12W,R12 etc */
+  if (s[0] == 'R' && isdigit((unsigned char)s[1])) {
+    char *endptr = NULL;
+    long v = strtol(s + 1, &endptr, 10);
+    if (v >= 8 && v <= 15) {
+      return &env->regs[v]; /* enum R_R8..R_R15 -> 8..15 */
+    }
+  }
+
+#endif
+
+#if defined(TARGET_AARCH64) || defined(TARGET_ARM)
+  CPUARMState* env = first_cpu->env_ptr;
+  if ((s[0] == 'X' || s[0] == 'W') && isdigit((unsigned char)s[1])) {
+    char *endptr = NULL;
+    long v = strtol(s + 1, &endptr, 10);
+    if (v >= 0 && v <= 31) {
+      return &env->xregs[v];
+    }
+  }
+
+  if (s[0] == 'R' && isdigit((unsigned char)s[1])) {
+    char *endptr = NULL;
+    long v = strtol(s + 1, &endptr, 10);
+    if (v >= 0 && v <= 15) {
+      return &env->regs[v];
+    }
+  }
+#endif
+
+  return NULL;
+}
+
+const char* ijon_to_str(IJON v) {
+  switch(v) {
+#define X(name, func) case e_##name: return #name;
+    IJON_LIST
+#undef X
+    default: return "UNKNOWN";
+  }
+}
+
+IJON str_to_ijon(const char* str) {
+#define X(name, func) if (strcmp(str, #name) == 0) return e_##name;
+  IJON_LIST
+#undef X
+  return -1;
+}
+
+void ijon_dispatch(IJON v, uint32_t addr, u64 val) {
+  switch(v) {
+#define X(name, func) case e_##name: func(addr, val); break;
+    IJON_LIST
+#undef X
+    default: printf("Unknown IJON value\n"); break;
+  }
+}
+
+// Reference from afl-compiler-rt.o.c
+
+/* IJON max tracking runtime functions */
+
+#include <stdarg.h>
+#include <time.h>
+
+/* Supporting hash functions */
+uint64_t ijon_simple_hash(uint64_t x) {
+
+  const uint64_t golden_ratio = 0x9E3779B97F4A7C15ULL;
+  return x * golden_ratio;
+
+}
+
+uint32_t ijon_hashint(uint32_t old, uint32_t val) {
+
+  // PERFECT HASH: Bit-interleaving approach for coordinate pairs
+  // Guarantees no hash collisions for coordinates < 65536
+  // Interleave bits of x and y to create unique 32-bit hash
+
+  uint32_t x = old;
+  uint32_t y = val;
+  uint32_t result = 0;
+
+  // Interleave the lower 16 bits of x and y
+  for (int i = 0; i < 16; i++) {
+
+    result |= ((x & (1U << i)) << i) | ((y & (1U << i)) << (i + 1));
+
+  }
+
+  // Apply mixing for better distribution in coverage map
+  result ^= result >> 16;
+  result *= 0x85ebca6b;
+  result ^= result >> 13;
+  result *= 0xc2b2ae35;
+  result ^= result >> 16;
+
+  return result;
+
+}
+
+uint32_t ijon_hashstr(uint32_t old, char *val) {
+
+  return ijon_hashmem(old, val, strlen(val));
+
+}
+
+uint32_t ijon_hashmem(uint32_t old, char *val, size_t len) {
+
+  old = ijon_hashint(old, len);
+  for (size_t i = 0; i < len; i++) {
+
+    old = ijon_hashint(old, val[i]);
+
+  }
+
+  return old;
+
+}
+
+void ijon_max(uint32_t addr, u64 val) {
+
+  // u32 var_id = (u32)(ijon_simple_hash((uint64_t)addr) % MAP_SIZE_IJON_ENTRIES);
+  u32 var_id = (u32)(addr % MAP_SIZE_IJON_ENTRIES);
+
+  if (ijon_max_ptr[var_id] < val) { ijon_max_ptr[var_id] = val; }
+
+}
+
+void ijon_min(uint32_t addr, u64 val) {
+
+  val = 0xffffffffffffffff - val;
+  ijon_max(addr, val);
+
+}
+
+void ijon_set(uint32_t loc_addr, uint32_t val) {
+
+  // ORIGINAL IJON APPROACH: XOR location hash with value to create unique
+  // coverage point This follows the original:
+  // ijon_map_set(ijon_hashstr(__LINE__,__FILE__)^(x))
+  u32 combined_hash = ijon_simple_hash(loc_addr) ^ val;
+  u32 coverage_id = combined_hash % MAP_SIZE_IJON_MAP;
+
+  ijon_map_ptr[coverage_id] = 1;
+
+}
+
+void ijon_inc(uint32_t loc_addr, uint32_t val) {
+
+  // ORIGINAL IJON APPROACH: XOR location hash with value to create unique
+  // coverage point This follows the original:
+  // ijon_map_set(ijon_hashstr(__LINE__,__FILE__)^(x))
+  uint32_t combined_hash = ijon_simple_hash(loc_addr) ^ val;
+  u32 coverage_id = combined_hash % MAP_SIZE_IJON_MAP;
+
+  // Memory-safe: Use actual available shared memory size
+  // Use AFL's incremental coverage approach (same as __afl_trace)
+  ijon_map_ptr[coverage_id] += 1;
+
+}
+
+/* Variadic runtime functions */
+void ijon_max_variadic(uint32_t addr, ...) {
+
+  va_list args;
+  va_start(args, addr);
+
+  u64 combined = 1;  // Start with 1 for Java-style hash
+  u64 value;
+  int arg_count = 0;
+
+  // Process all arguments until we hit the sentinel (0)
+  // Using Java-style hash: hash = 31 * hash + value
+  while ((value = va_arg(args, u64)) != 0) {
+
+    combined = combined * 31 + value;
+    arg_count++;
+
+    // CRITICAL: Prevent infinite loops if sentinel is missing
+    if (arg_count > 20) { break; }
+
+  }
+
+  va_end(args);
+
+  // Call the basic ijon_max function
+  ijon_max(addr, combined);
+
+}
+
+void ijon_min_variadic(uint32_t addr, ...) {
+
+  va_list args;
+  va_start(args, addr);
+
+  u64 combined = 1;  // Start with 1 for Java-style hash
+  u64 value;
+  int arg_count = 0;
+
+  // Process all arguments until we hit the sentinel (0)
+  // Using Java-style hash: hash = 31 * hash + value
+  while ((value = va_arg(args, u64)) != 0) {
+
+    combined = combined * 31 + value;
+    arg_count++;
+
+    // CRITICAL: Prevent infinite loops if sentinel is missing
+    if (arg_count > 20) { break; }
+
+  }
+
+  va_end(args);
+
+  // Call the basic ijon_min function
+  ijon_min(addr, combined);
+
+}
+
+/* IJON state management functions */
+
+void ijon_xor_state(uint32_t addr, u64 val) {
+
+  __afl_ijon_state = (__afl_ijon_state ^ addr) % (u32)MAP_SIZE_IJON_MAP;
+
+}
+
+void ijon_reset_state(uint32_t addr, u64 val) {
+
+  __afl_ijon_state = 0;
+  __afl_ijon_state_log = 0;
+
+}
+
+/* String and memory distance functions */
+
+uint32_t ijon_strdist(char *a, char *b) {
+
+  if (!a && !b) return 0;
+  if (!a) return strlen(b);
+  if (!b) return strlen(a);
+
+  size_t len_a = strlen(a);
+  size_t len_b = strlen(b);
+
+  return ijon_memdist(a, b, len_a > len_b ? len_a : len_b);
+
+}
+
+uint32_t ijon_memdist(char *a, char *b, size_t len) {
+
+  if (!a && !b) return 0;
+  if (!a || !b) return (uint32_t)len;
+  if (len == 0) return 0;
+
+  // For efficiency with large strings, use a bounded Levenshtein distance
+  // Limit the maximum distance calculation to avoid performance issues
+  size_t max_dist = len > 1024 ? 1024 : len;
+
+  // Use Levenshtein distance algorithm (edit distance)
+  // For memory efficiency, use a rolling array approach for large strings
+  if (max_dist <= 256) {
+
+    // Small strings: use full matrix approach
+    uint32_t matrix[257][257];  // max_dist + 1
+
+    // Initialize first row and column
+    for (size_t i = 0; i <= max_dist; i++) {
+
+      matrix[i][0] = i;
+      matrix[0][i] = i;
+
+    }
+
+    // Fill the matrix
+    for (size_t i = 1; i <= max_dist && i <= strlen(a); i++) {
+
+      for (size_t j = 1; j <= max_dist && j <= strlen(b); j++) {
+
+        uint32_t cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+
+        uint32_t deletion = matrix[i - 1][j] + 1;
+        uint32_t insertion = matrix[i][j - 1] + 1;
+        uint32_t substitution = matrix[i - 1][j - 1] + cost;
+
+        matrix[i][j] =
+            deletion < insertion
+                ? (deletion < substitution ? deletion : substitution)
+                : (insertion < substitution ? insertion : substitution);
+
+      }
+
+    }
+
+    size_t actual_len_a = strlen(a) > max_dist ? max_dist : strlen(a);
+    size_t actual_len_b = strlen(b) > max_dist ? max_dist : strlen(b);
+
+    return matrix[actual_len_a][actual_len_b];
+
+  } else {
+
+    // Large strings: use simplified byte-by-byte comparison with early
+    // termination
+    uint32_t differences = 0;
+    size_t   min_len = strlen(a) < strlen(b) ? strlen(a) : strlen(b);
+    size_t   max_len = strlen(a) > strlen(b) ? strlen(a) : strlen(b);
+
+    // Count character differences up to min_len
+    for (size_t i = 0; i < min_len && i < max_dist; i++) {
+
+      if (a[i] != b[i]) { differences++; }
+
+    }
+
+    // Add length difference
+    differences += (uint32_t)(max_len - min_len);
+
+    return differences > max_dist ? max_dist : differences;
+
+  }
 
 }
 
@@ -351,7 +910,7 @@ void afl_setup(void) {
     if (inst_r) afl_area_ptr[0] = 1;
 
   }
-  
+
   disable_caching = getenv("AFL_QEMU_DISABLE_CACHE") != NULL;
 
   if (getenv("___AFL_EINS_ZWEI_POLIZEI___")) {  // CmpLog forkserver
@@ -376,7 +935,7 @@ void afl_setup(void) {
     afl_end_code = (abi_ulong)-1;
 
   }
-  
+
   if (getenv("AFL_CODE_START"))
     afl_start_code = strtoll(getenv("AFL_CODE_START"), NULL, 16);
   if (getenv("AFL_CODE_END"))
@@ -387,17 +946,17 @@ void afl_setup(void) {
     char *str = getenv("AFL_QEMU_INST_RANGES");
     char *saveptr1, *saveptr2 = NULL, *save_pt1 = NULL;
     char *pt1, *pt2, *pt3 = NULL;
-    
+
     while (1) {
 
       pt1 = strtok_r(str, ",", &saveptr1);
       if (pt1 == NULL) break;
       str = NULL;
       save_pt1 = strdup(pt1);
-      
+
       pt2 = strtok_r(pt1, "-", &saveptr2);
       pt3 = strtok_r(NULL, "-", &saveptr2);
-      
+
       struct vmrange* n = calloc(1, sizeof(struct vmrange));
       n->next = afl_instr_code;
 
@@ -419,7 +978,7 @@ void afl_setup(void) {
           n->name = save_pt1;
         }
       }
-      
+
       afl_instr_code = n;
 
     }
@@ -532,7 +1091,7 @@ void afl_setup(void) {
      behaviour, and seems to work alright? */
 
   rcu_disable_atfork();
-  
+
   if (getenv("AFL_QEMU_PERSISTENT_HOOK")) {
 
 #ifdef AFL_QEMU_STATIC_BUILD
@@ -575,9 +1134,9 @@ void afl_setup(void) {
 #endif
 
   }
-  
+
   if (__afl_cmp_map) return; // no persistent for cmplog
-  
+
   is_persistent = getenv("AFL_QEMU_PERSISTENT_ADDR") != NULL;
 
   if (is_persistent)
@@ -600,28 +1159,28 @@ void afl_setup(void) {
     afl_persistent_cnt = strtoll(getenv("AFL_QEMU_PERSISTENT_CNT"), NULL, 0);
   else
     afl_persistent_cnt = 0;
-    
+
   if (getenv("AFL_QEMU_PERSISTENT_EXITS")) persistent_exits = 1;
 
   // TODO persistent exits for other archs not x86
   // TODO persistent mode for other archs not x86
   // TODO cmplog rtn for arm
-  
+
   if (getenv("AFL_QEMU_SNAPSHOT")) {
-  
+
     is_persistent = 1;
     persistent_save_gpr = 1;
     persistent_memory = 1;
     persistent_exits = 1;
-    
+
     if (afl_persistent_addr == 0)
       afl_persistent_addr = strtoll(getenv("AFL_QEMU_SNAPSHOT"), NULL, 0);
-  
+
   }
-  
+
   if (persistent_memory && afl_snapshot_init() >= 0)
     lkm_snapshot = 1;
-  
+
   if (getenv("AFL_DEBUG")) {
     if (is_persistent)
       fprintf(stderr, "Persistent: 0x%lx [0x%lx] %s%s%s\n",
@@ -631,6 +1190,8 @@ void afl_setup(void) {
               (persistent_memory ? "mem ": ""),
               (persistent_exits ? "exits ": ""));
   }
+
+  qemu_ijon_init();
 
 }
 
@@ -643,55 +1204,90 @@ void afl_forkserver(CPUState *cpu) {
 
   if (getenv("AFL_QEMU_DEBUG_MAPS")) open_self_maps(cpu->env_ptr, 1);
 
-  //u32   map_size = 0;
-  unsigned char tmp[4] = {0};
+  u32 __afl_old_forkserver = 0;
   pid_t child_pid;
   int   t_fd[2];
   u8    child_stopped = 0;
   u32   was_killed;
-  int   status = 0;
+  u32 version = 0x41464c00 + FS_NEW_VERSION_MAX;
+  u32 tmp = version ^ 0xffffffff, status2, status = version;
+  u8 *msg = (u8 *)&status;
+  u8 *reply = (u8 *)&status2;
 
-  if (!getenv("AFL_OLD_FORKSERVER")) {
-
-    // with the max ID value
-    if (MAP_SIZE <= FS_OPT_MAX_MAPSIZE)
-      status |= (FS_OPT_SET_MAPSIZE(MAP_SIZE) | FS_OPT_MAPSIZE);
-    if (lkm_snapshot) status |= FS_OPT_SNAPSHOT;
-    if (sharedmem_fuzzing != 0) status |= FS_OPT_SHDMEM_FUZZ;
-    if (status) status |= (FS_OPT_ENABLED | FS_OPT_NEWCMPLOG);
-
-  }
-
-  memcpy(tmp, &status, 4);
   if (getenv("AFL_DEBUG"))
     fprintf(stderr, "Debug: Sending status 0x%08x\n", status);
+
+  if (getenv("AFL_OLD_FORKSERVER")) {
+
+    __afl_old_forkserver = 1;
+    status = 0;
+
+    fprintf(stderr, "The current version of afl++ qemu mode "
+      "supports forkserver v1, but afl-fuzz still retains "
+      "support for the old forkserver (qemu) version\n");
+
+  }
 
   /* Tell the parent that we're alive. If the parent doesn't want
      to talk, assume that we're not running in forkserver mode. */
 
-  if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+  if (write(FORKSRV_FD + 1, msg, 4) != 4) return;
 
   afl_forksrv_pid = getpid();
 
   int first_run = 1;
 
-  if (sharedmem_fuzzing) {
+  if (!__afl_old_forkserver) {
 
-    if (read(FORKSRV_FD, &was_killed, 4) != 4) exit(2);
+    if (read(FORKSRV_FD, reply, 4) != 4) { _exit(1); }
+    if (tmp != status2) {
 
-    if ((was_killed & (0xffffffff & (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ))) ==
-        (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ))
-      afl_map_shm_fuzz();
-    else {
-
-      fprintf(stderr,
-              "[AFL] ERROR: afl-fuzz is old and does not support"
-              " shmem input");
-      exit(1);
+      fprintf(stderr, "wrong forkserver message from AFL++ tool");
+      _exit(1);
 
     }
 
+    // send the set/requested options to forkserver
+    status = FS_NEW_OPT_MAPSIZE;  // we always send the map size
+    if (lkm_snapshot) status |= FS_OPT_SNAPSHOT;
+    if (sharedmem_fuzzing) status |= FS_NEW_OPT_SHDMEM_FUZZ;
+
+    u32 __afl_map_size = MAP_SIZE;
+
+    if (use_ijon) {
+
+      __afl_map_size = (((__afl_map_size + 63) >> 6) << 6);
+      __afl_map_size += MAP_SIZE_IJON_MAP + MAP_SIZE_IJON_BYTES;
+
+      ijon_map_ptr = afl_area_ptr + MAP_SIZE;
+      ijon_max_ptr = ijon_map_ptr + MAP_SIZE_IJON_MAP;
+
+      status |= FS_OPT_IJON;
+
+    }
+
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) {
+
+      errno = 0;
+      _exit(1);
+
+    }
+
+    // Now send the parameters for the set options, increasing by option number
+
+    // FS_NEW_OPT_MAPSIZE - we always send the map size
+    status = __afl_map_size;
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) { _exit(1); }
+
+    // send welcome message as final message
+    status = version;
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) { _exit(1); }
+
   }
+
+  // END forkserver handshake
+
+  if (sharedmem_fuzzing) { afl_map_shm_fuzz(); }
 
   /* All right, let's await orders... */
 
@@ -792,15 +1388,15 @@ void afl_persistent_iter(CPUArchState *env) {
   static struct afl_tsl exit_cmd_tsl;
 
   if (!afl_persistent_cnt || --cycle_cnt) {
-  
+
     if (persistent_memory) restore_memory_snapshot();
-  
+
     if (persistent_save_gpr && !afl_persistent_hook_ptr) {
       afl_restore_regs(&saved_regs, env);
     }
 
     if (!disable_caching) {
-  
+
       memset(&exit_cmd_tsl, 0, sizeof(struct afl_tsl));
       exit_cmd_tsl.tb.pc = (target_ulong)(-1);
 
@@ -812,16 +1408,16 @@ void afl_persistent_iter(CPUArchState *env) {
         exit(0);
 
       }
-    
+
     }
 
     // TODO use only pipe
     raise(SIGSTOP);
 
-    
+
     // now we have shared_buf updated and ready to use
     if (persistent_save_gpr && afl_persistent_hook_ptr) {
-    
+
       struct api_regs hook_regs = saved_regs;
       afl_persistent_hook_ptr(&hook_regs, guest_base, shared_buf,
                               *shared_buf_len);
@@ -859,15 +1455,15 @@ void afl_persistent_loop(CPUArchState *env) {
       afl_prev_loc = 0;
 
     }
-    
+
     if (persistent_memory) collect_memory_snapshot();
-    
+
     if (persistent_save_gpr) {
-    
+
       afl_save_regs(&saved_regs, env);
-      
+
       if (afl_persistent_hook_ptr) {
-      
+
         struct api_regs hook_regs = saved_regs;
         afl_persistent_hook_ptr(&hook_regs, guest_base, shared_buf,
                                 *shared_buf_len);
@@ -876,7 +1472,7 @@ void afl_persistent_loop(CPUArchState *env) {
       }
 
     }
-    
+
     cycle_cnt = afl_persistent_cnt;
     persistent_first_pass = 0;
     persistent_stack_offset = TARGET_LONG_BITS / 8;
@@ -923,7 +1519,7 @@ static void afl_request_tsl(target_ulong pc, target_ulong cb, uint32_t flags,
     t.chain.tb_exit = tb_exit;
 
   }
-  
+
   if (write(TSL_FD, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
     return;
 

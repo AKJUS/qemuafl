@@ -37,6 +37,8 @@
 #include "qemuafl/cpu-translate.h"
 #include "qemuafl/api.h"
 
+#include "qemuafl/qemu-ijon-support.h"
+
 #define AFL_QEMU_TARGET_I386_SNIPPET                                          \
   if (is_persistent) {                                                        \
                                                                               \
@@ -8714,6 +8716,8 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         return;
     }
 #endif
+
+    INSTALL_IJON_HOOKS();
 
     pc_next = disas_insn(dc, cpu);
 
