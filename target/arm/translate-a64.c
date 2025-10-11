@@ -41,7 +41,7 @@
 
 #include "qemuafl/cpu-translate.h"
 #include "qemuafl/qasan-qemu.h"
-
+#include "qemuafl/qemu-ijon-support.h"
 // SP = 31, LINK = 30
 
 #define AFL_QEMU_TARGET_ARM64_SNIPPET                                         \
@@ -14876,6 +14876,21 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     CPUARMState *env = cpu->env_ptr;
+
+    for (int i = 0; i < ijon_hooker_cnt; i++) {
+      if (dc->base.pc_next == hook_code_addr[i]) {
+        TCGv var_addr = tcg_const_tl(g_var_addr[i]);
+        TCGv var_len = tcg_const_tl(g_var_len[i]);
+        TCGv itype = tcg_const_tl(ijon_type[i]);
+        TCGv idx = tcg_const_tl(i);
+        gen_helper_ijon_func_call(var_addr, var_len, itype, idx);
+        fprintf(stderr, "install ijon hook in %lx\n", hook_code_addr[i]);
+        tcg_temp_free(var_addr);
+        tcg_temp_free(var_len);
+        tcg_temp_free(itype);
+        tcg_temp_free(idx);
+      }
+    }
 
     if (dc->ss_active && !dc->pstate_ss) {
         /* Singlestep state is Active-pending.
