@@ -285,7 +285,7 @@ static void restore_memory_snapshot(void) {
 
 static int use_ijon = 0;
 static unsigned char *ijon_map_ptr = dummy;
-static unsigned char *ijon_max_ptr = dummy;
+static uint64_t *ijon_max_ptr = dummy;
 
 /* IJON state tracking globals */
 #if defined(__ANDROID__) || defined(__HAIKU__) || defined(NO_TLS)
@@ -1260,7 +1260,7 @@ void afl_forkserver(CPUState *cpu) {
       __afl_map_size += MAP_SIZE_IJON_MAP + MAP_SIZE_IJON_BYTES;
 
       ijon_map_ptr = afl_area_ptr + MAP_SIZE;
-      ijon_max_ptr = ijon_map_ptr + MAP_SIZE_IJON_MAP;
+      ijon_max_ptr = (uint64_t*)(ijon_map_ptr + MAP_SIZE_IJON_MAP);
 
       status |= FS_OPT_IJON;
 
