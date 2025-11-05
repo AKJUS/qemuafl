@@ -824,6 +824,10 @@ do
     fi
 done
 
+if has meson
+then
+    meson="$(command -v meson)"
+fi
 
 # Check for ancillary tools used in testing
 genisoimage=
@@ -1946,48 +1950,13 @@ python_version=$($python -c 'import sys; print("%d.%d.%d" % (sys.version_info[0]
 # Suppress writing compiled files
 python="$python -B"
 
-if test -z "$meson"; then
-    if test "$explicit_python" = no && has meson && version_ge "$(meson --version)" 0.55.3; then
-        meson=meson
-    elif test $git_submodules_action != 'ignore' ; then
-        meson=git
-    elif test -e "${source_path}/meson/meson.py" ; then
-        meson=internal
-    else
-        if test "$explicit_python" = yes; then
-            error_exit "--python requires using QEMU's embedded Meson distribution, but it was not found."
-        else
-            error_exit "Meson not found.  Use --meson=/path/to/meson"
-        fi
-    fi
-else
-    # Meson uses its own Python interpreter to invoke other Python scripts,
-    # but the user wants to use the one they specified with --python.
-    #
-    # We do not want to override the distro Python interpreter (and sometimes
-    # cannot: for example in Homebrew /usr/bin/meson is a bash script), so
-    # just require --meson=git|internal together with --python.
-    if test "$explicit_python" = yes; then
-        case "$meson" in
-            git | internal) ;;
-            *) error_exit "--python requires using QEMU's embedded Meson distribution." ;;
-        esac
-    fi
+# Probe for Meson
+if ! has "$meson"
+then
+    error_exit "Meson not found"
 fi
-
-if test "$meson" = git; then
-    git_submodules="${git_submodules} meson"
-fi
-
-case "$meson" in
-    git | internal)
-        meson="$python ${source_path}/meson/meson.py"
-        ;;
-    *) meson=$(command -v "$meson") ;;
-esac
 
 # Probe for ninja
-
 if test -z "$ninja"; then
     for c in ninja ninja-build samu; do
         if has $c; then
@@ -6354,6 +6323,9 @@ test -n "$objcc" && echo "objc = [$(meson_quote $objcc)]" >> $cross
 echo "ar = [$(meson_quote $ar)]" >> $cross
 echo "nm = [$(meson_quote $nm)]" >> $cross
 echo "pkgconfig = [$(meson_quote $pkg_config_exe)]" >> $cross
+if test "$explicit_python" = yes; then
+    echo "python = [$(meson_quote $python)]" >> $cross
+fi
 echo "ranlib = [$(meson_quote $ranlib)]" >> $cross
 if has $sdl2_config; then
   echo "sdl2-config = [$(meson_quote $sdl2_config)]" >> $cross
