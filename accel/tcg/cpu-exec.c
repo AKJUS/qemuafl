@@ -583,14 +583,16 @@ void ijon_dispatch(IJON v, uint32_t addr, u64 val) {
 #include <time.h>
 
 /* Supporting hash functions */
-uint64_t ijon_simple_hash(uint64_t x) {
+static uint64_t ijon_simple_hash(uint64_t x)
+{
 
   const uint64_t golden_ratio = 0x9E3779B97F4A7C15ULL;
   return x * golden_ratio;
 
 }
 
-uint32_t ijon_hashint(uint32_t old, uint32_t val) {
+static uint32_t ijon_hashint(uint32_t old, uint32_t val)
+{
 
   // PERFECT HASH: Bit-interleaving approach for coordinate pairs
   // Guarantees no hash collisions for coordinates < 65536
@@ -618,7 +620,8 @@ uint32_t ijon_hashint(uint32_t old, uint32_t val) {
 
 }
 
-uint32_t ijon_hashstr(uint32_t old, char *val) {
+static uint32_t ijon_hashstr(uint32_t old, char *val)
+{
 
   return ijon_hashmem(old, val, strlen(val));
 
@@ -680,7 +683,8 @@ void ijon_inc(uint32_t loc_addr, uint32_t val) {
 }
 
 /* Variadic runtime functions */
-void ijon_max_variadic(uint32_t addr, ...) {
+static void ijon_max_variadic(uint32_t addr, ...)
+{
 
   va_list args;
   va_start(args, addr);
@@ -708,7 +712,8 @@ void ijon_max_variadic(uint32_t addr, ...) {
 
 }
 
-void ijon_min_variadic(uint32_t addr, ...) {
+static void ijon_min_variadic(uint32_t addr, ...)
+{
 
   va_list args;
   va_start(args, addr);
@@ -753,7 +758,8 @@ void ijon_reset_state(uint32_t addr, u64 val) {
 
 /* String and memory distance functions */
 
-uint32_t ijon_strdist(char *a, char *b) {
+static uint32_t ijon_strdist(char *a, char *b)
+{
 
   if (!a && !b) return 0;
   if (!a) return strlen(b);
@@ -1304,7 +1310,7 @@ void afl_forkserver(CPUState *cpu) {
     if (child_stopped && was_killed) {
 
       child_stopped = 0;
-      if (waitpid(child_pid, &status, 0) < 0) exit(8);
+      if (waitpid(child_pid, (int *)&status, 0) < 0) exit(8);
 
     }
 
@@ -1355,7 +1361,7 @@ void afl_forkserver(CPUState *cpu) {
 
     /* Get and relay exit status to parent. */
 
-    if (waitpid(child_pid, &status, is_persistent ? WUNTRACED : 0) < 0) exit(6);
+    if (waitpid(child_pid, (int *)&status, is_persistent ? WUNTRACED : 0) < 0) exit(6);
 
     /* In persistent mode, the child stops itself with SIGSTOP to indicate
        a successful run. In this case, we want to wake it up without forking

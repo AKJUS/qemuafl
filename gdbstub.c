@@ -65,12 +65,12 @@ static int phy_memory_mode;
 
 
 void (*signal_handler)(int);
-void set_signal_callback(void (*sg)(int)){
+static void set_signal_callback(void (*sg)(int)){
     signal_handler = sg;
 }
 
-int target_memory_rw_debug(CPUState *cpu, target_ulong addr,
-                                         uint8_t *buf, int len, bool is_write)
+static int target_memory_rw_debug(CPUState *cpu, target_ulong addr,
+                                  uint8_t *buf, int len, bool is_write)
 {
     CPUClass *cc;
 
@@ -383,7 +383,7 @@ typedef struct GDBState {
 static int sstep_flags = SSTEP_ENABLE|SSTEP_NOIRQ|SSTEP_NOTIMER;
 
 /* Retrieves flags for single step mode. */
-int get_sstep_flags(void)
+static int get_sstep_flags(void)
 {
     /*
      * In replay mode all events written into the log should be replayed.
@@ -473,7 +473,7 @@ int use_gdb_syscalls(void)
 }
 
 /* Resume execution.  */
-void gdb_continue(void)
+static void gdb_continue(void)
 {
 
 #ifdef CONFIG_USER_ONLY
@@ -926,7 +926,7 @@ static const char *get_feature_xml(const char *p, const char **newp,
     return name ? xml_builtin[i][1] : NULL;
 }
 
-int gdb_read_register(CPUState *cpu, GByteArray *buf, int reg)
+static int gdb_read_register(CPUState *cpu, GByteArray *buf, int reg)
 {
     CPUClass *cc = CPU_GET_CLASS(cpu);
     CPUArchState *env = cpu->env_ptr;
@@ -944,7 +944,7 @@ int gdb_read_register(CPUState *cpu, GByteArray *buf, int reg)
     return 0;
 }
 
-int gdb_write_register(CPUState *cpu, uint8_t *mem_buf, int reg)
+static int gdb_write_register(CPUState *cpu, uint8_t *mem_buf, int reg)
 {
     CPUClass *cc = CPU_GET_CLASS(cpu);
     CPUArchState *env = cpu->env_ptr;
@@ -1023,7 +1023,7 @@ static inline int xlat_gdb_type(CPUState *cpu, int gdbtype)
 }
 #endif
 
-int gdb_breakpoint_insert(int type, target_ulong addr, target_ulong len)
+static int gdb_breakpoint_insert(int type, target_ulong addr, target_ulong len)
 {
     CPUState *cpu;
     int err = 0;
@@ -1060,7 +1060,7 @@ int gdb_breakpoint_insert(int type, target_ulong addr, target_ulong len)
     }
 }
 
-int gdb_breakpoint_remove(int type, target_ulong addr, target_ulong len)
+static int gdb_breakpoint_remove(int type, target_ulong addr, target_ulong len)
 {
     CPUState *cpu;
     int err = 0;
@@ -1128,7 +1128,7 @@ static void gdb_breakpoint_remove_all(void)
     }
 }
 
-void gdb_set_cpu_pc(target_ulong pc)
+static void gdb_set_cpu_pc(target_ulong pc)
 {
     CPUState *cpu = gdbserver_state.c_cpu;
 
@@ -3215,7 +3215,7 @@ void gdb_signalled(CPUArchState *env, int sig)
     put_packet(buf);
 }
 
-void gdb_accept_init(int fd)
+static void gdb_accept_init(int fd)
 {
     init_gdbserver_state();
     create_default_process(&gdbserver_state);
