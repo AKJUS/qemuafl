@@ -1310,7 +1310,7 @@ void afl_forkserver(CPUState *cpu) {
     if (child_stopped && was_killed) {
 
       child_stopped = 0;
-      if (waitpid(child_pid, &status, 0) < 0) exit(8);
+      if (waitpid(child_pid, (int *)&status, 0) < 0) exit(8);
 
     }
 
@@ -1361,7 +1361,7 @@ void afl_forkserver(CPUState *cpu) {
 
     /* Get and relay exit status to parent. */
 
-    if (waitpid(child_pid, &status, is_persistent ? WUNTRACED : 0) < 0) exit(6);
+    if (waitpid(child_pid, (int *)&status, is_persistent ? WUNTRACED : 0) < 0) exit(6);
 
     /* In persistent mode, the child stops itself with SIGSTOP to indicate
        a successful run. In this case, we want to wake it up without forking
